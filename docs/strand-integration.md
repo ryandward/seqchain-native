@@ -1,6 +1,6 @@
 # Strand Integration — Current State and Gaps
 
-This document assesses how seqchain-native uses `@strand/core`, what parts of
+This document assesses how needletail uses `@strand/core`, what parts of
 the Strand feature surface are being wasted, and what is genuinely missing.
 
 ---
@@ -129,7 +129,7 @@ const drainLoop = async () => {
 await Promise.all([streamPromise, drainLoop()]);
 ```
 
-For seqchain-native's current workload (small genomes, exact matches, bounded
+For needletail's current workload (small genomes, exact matches, bounded
 hit counts) this has not mattered. It will matter for any genome larger than
 roughly `index_capacity × RECORD_STRIDE` bytes of results.
 

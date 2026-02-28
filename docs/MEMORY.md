@@ -1,8 +1,8 @@
-# seqchain-native Memory
+# needletail Memory
 
 ## Project Overview
 PyO3 Python extension for width-first SIMD FM-Index search (CRISPR guide off-target).
-Located at `/home/ryan.ward/Git/seqchain-native/`.
+Located at `/home/ryan.ward/Git/needletail/`.
 
 ## Key Architecture Facts
 
@@ -52,9 +52,9 @@ buildSchema alignment rules give f32 at offset **12** (not 10 as the plan stated
 ## Build Commands
 ```bash
 cd ~/Git/strand && npm run build     # prerequisite
-cd ~/Git/seqchain-native
+cd ~/Git/needletail
 npm install
-npm run build    # → seqchain-native.linux-x64-gnu.node
+npm run build    # → needletail.linux-x64-gnu.node
 npm test         # vitest run — 16 tests pass
 ```
 
@@ -88,7 +88,7 @@ Fix: use inclusive bounds internally, initial `r = sa.len() - 1`, convert to exc
 
 ## Strand Version
 Strand is at v4. `strand.rs` must have `STRAND_VERSION: u32 = 4`.
-v3→v4 change: metadata region in header tail (unused by seqchain-native producer; harmless).
+v3→v4 change: metadata region in header tail (unused by needletail producer; harmless).
 
 ## Backpressure in Tests
 The backpressure test uses a **drain loop** that polls `CTRL_COMMIT_SEQ` every 2ms

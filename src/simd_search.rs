@@ -23,10 +23,43 @@ use std::slice;
 use memmap2::Mmap;
 use tempfile::tempfile;
 
+use crate::fm_index::{RankBlock, BLOCK_SIZE};
 use crate::kmer_index::{self, KmerSeed, KmerSeedTable, PosTable};
 
 // Precomputed score table: score[mm] = 1.0 / (1.0 + mm)
 const SCORE_LUT: [f32; 4] = [1.0, 0.5, 1.0 / 3.0, 0.25];
+
+/// Reusable workspace to eliminate per-BWT-step heap allocations.
+/// Allocated once per search pipeline, cleared and reused at every depth step.
+pub(crate) struct StepWorkspace {
+    // Non-dedup path
+    pub qchar: Vec<u8>,
+    pub c_l: Vec<u32>,
+    pub c_r: Vec<u32>,
+    pub c_bud: Vec<u8>,
+    pub c_qid: Vec<u32>,
+    pub c_str: Vec<u8>,
+    pub c_valid: Vec<u8>,
+    // Dedup path
+    pub order: Vec<u32>,
+    pub group_starts: Vec<usize>,
+}
+
+impl StepWorkspace {
+    pub fn new() -> Self {
+        StepWorkspace {
+            qchar: Vec::new(),
+            c_l: Vec::new(),
+            c_r: Vec::new(),
+            c_bud: Vec::new(),
+            c_qid: Vec::new(),
+            c_str: Vec::new(),
+            c_valid: Vec::new(),
+            order: Vec::new(),
+            group_starts: Vec::new(),
+        }
+    }
+}
 
 pub const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
 
@@ -37,6 +70,7 @@ pub const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
 pub struct HitAccumulator {
     pub query_id: Vec<u32>,
     pub position: Vec<u32>,
+    pub strand: Vec<bool>,
     pub score: Vec<f32>,
 }
 
@@ -45,14 +79,16 @@ impl HitAccumulator {
         Self {
             query_id: Vec::new(),
             position: Vec::new(),
+            strand: Vec::new(),
             score: Vec::new(),
         }
     }
 
     #[inline]
-    pub fn push(&mut self, query_id: u32, position: u32, score: f32) {
+    pub fn push(&mut self, query_id: u32, position: u32, strand: bool, score: f32) {
         self.query_id.push(query_id);
         self.position.push(position);
+        self.strand.push(strand);
         self.score.push(score);
     }
 }
@@ -86,10 +122,15 @@ pub trait FmOcc {
     #[inline]
     fn prefetch_lf(&self, _l: usize, _r: usize) {}
 
-    /// Raw interleaved rank data for SIMD access.
+    /// Raw interleaved rank data for SIMD access (legacy flat layout).
     /// Returns `(data_slice, less_table)` where `data_slice[pos*4 + base_idx]` = occ count.
-    /// `None` = no SIMD-compatible layout available (use scalar `lf_map` instead).
+    /// `None` = no flat layout available (use `rank_blocks()` or scalar `lf_map` instead).
     fn rank_data(&self) -> Option<(&[u32], &[usize; 256])> { None }
+
+    /// Cache-line-aligned rank blocks for SIMD access.
+    /// Returns `(blocks, less_table)` where each `RankBlock` is 64 bytes covering
+    /// 64 BWT positions. Preferred over `rank_data()` — 16× smaller, fits in L3.
+    fn rank_blocks(&self) -> Option<(&[RankBlock], &[usize; 256])> { None }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -522,11 +563,12 @@ pub fn step_depth_mmap<I: FmOcc>(
                 let score = SCORE_LUT[mm_used as usize];
                 let lo = c_l[j] as usize;
                 let hi = c_r[j] as usize + 1;
+                let fwd = c_str[j] != 0;
 
                 for sa_idx in lo..hi {
                     let sa_pos = index.sa(sa_idx);
                     if chroms.is_valid(sa_pos, query_len) {
-                        hits.push(c_qid[j], sa_pos as u32, score);
+                        hits.push(c_qid[j], sa_pos as u32, fwd, score);
                     }
                 }
             } else {
@@ -555,6 +597,7 @@ pub fn step_depth<I: FmOcc>(
     chroms: &ChromGeometry,
     hits: &mut HitAccumulator,
     next: &mut SearchFrontier,
+    ws: &mut StepWorkspace,
 ) {
     let n = frontier.len();
     if n == 0 {
@@ -563,7 +606,17 @@ pub fn step_depth<I: FmOcc>(
     next.clear();
 
     let col = query_len - 1 - depth;
-    let mut qchar: Vec<u8> = Vec::with_capacity(n);
+
+    // Take workspace buffers (zero-alloc after first step — retains capacity).
+    let mut qchar = std::mem::take(&mut ws.qchar);
+    let mut c_l = std::mem::take(&mut ws.c_l);
+    let mut c_r = std::mem::take(&mut ws.c_r);
+    let mut c_bud = std::mem::take(&mut ws.c_bud);
+    let mut c_qid = std::mem::take(&mut ws.c_qid);
+    let mut c_str = std::mem::take(&mut ws.c_str);
+    let mut c_valid = std::mem::take(&mut ws.c_valid);
+
+    qchar.clear();
     for i in 0..n {
         let qid = frontier.query_id[i] as usize;
         qchar.push(if frontier.strand[i] != 0 {
@@ -574,12 +627,12 @@ pub fn step_depth<I: FmOcc>(
     }
 
     let cap = 4 * n;
-    let mut c_l = Vec::with_capacity(cap);
-    let mut c_r = Vec::with_capacity(cap);
-    let mut c_bud = Vec::with_capacity(cap);
-    let mut c_qid = Vec::with_capacity(cap);
-    let mut c_str = Vec::with_capacity(cap);
-    let mut c_valid = Vec::with_capacity(cap);
+    c_l.clear();
+    c_r.clear();
+    c_bud.clear();
+    c_qid.clear();
+    c_str.clear();
+    c_valid.clear();
 
     for &base in &BASES {
         let less_b = index.less(base);
@@ -612,16 +665,26 @@ pub fn step_depth<I: FmOcc>(
             let score = SCORE_LUT[mm_used as usize];
             let lo = c_l[j] as usize;
             let hi = c_r[j] as usize + 1;
+            let fwd = c_str[j] != 0;
             for sa_idx in lo..hi {
                 let sa_pos = index.sa(sa_idx);
                 if chroms.is_valid(sa_pos, query_len) {
-                    hits.push(c_qid[j], sa_pos as u32, score);
+                    hits.push(c_qid[j], sa_pos as u32, fwd, score);
                 }
             }
         } else {
             next.push(c_l[j], c_r[j], c_bud[j], c_qid[j], c_str[j]);
         }
     }
+
+    // Return buffers to workspace (capacity preserved for next step).
+    ws.qchar = qchar;
+    ws.c_l = c_l;
+    ws.c_r = c_r;
+    ws.c_bud = c_bud;
+    ws.c_qid = c_qid;
+    ws.c_str = c_str;
+    ws.c_valid = c_valid;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -701,6 +764,56 @@ fn dedup_frontier(frontier: &mut SearchFrontier, lineage: &mut LineageTable) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  Block-Based SIMD Rank Helper
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compute rank for all 4 bases at `pos` using SSE2 and cache-line-aligned blocks.
+///
+/// Returns `__m128i` with `[rank_A, rank_C, rank_G, rank_T]` as i32 lanes.
+/// Each block is 64 bytes (1 cache line): a single memory fetch provides all data
+/// needed for the rank query. The popcount is computed via 4 scalar POPCNT
+/// instructions (~1 cycle each), negligible vs the ~90ns DRAM savings.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn rank_all_blocks_sse(blocks: &[RankBlock], pos: usize) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+
+    let block = &blocks[pos / BLOCK_SIZE];
+    let offset = pos % BLOCK_SIZE;
+
+    // Select counts and bitvector half based on offset within block.
+    let (base_counts, bv) = if offset < 32 {
+        (
+            _mm_load_si128(block.counts.as_ptr() as *const __m128i),
+            _mm_load_si128(block.bv_lo.as_ptr() as *const __m128i),
+        )
+    } else {
+        (
+            _mm_load_si128(block.mid.as_ptr() as *const __m128i),
+            _mm_load_si128(block.bv_hi.as_ptr() as *const __m128i),
+        )
+    };
+
+    // Inclusive mask: bits 0..=(offset % 32) are set.
+    let shift = (offset % 32) + 1;
+    let mask_val = if shift >= 32 { u32::MAX } else { (1u32 << shift) - 1 };
+    let mask = _mm_set1_epi32(mask_val as i32);
+    let masked = _mm_and_si128(bv, mask);
+
+    // Popcount per 32-bit lane via scalar POPCNT.
+    let mut bv_arr = [0u32; 4];
+    _mm_storeu_si128(bv_arr.as_mut_ptr() as *mut __m128i, masked);
+    let pop = _mm_set_epi32(
+        bv_arr[3].count_ones() as i32,
+        bv_arr[2].count_ones() as i32,
+        bv_arr[1].count_ones() as i32,
+        bv_arr[0].count_ones() as i32,
+    );
+
+    _mm_add_epi32(base_counts, pop)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Unified Cost-Based Depth Step with Lineage Dedup
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -759,10 +872,11 @@ fn dispatch_survivors<I: FmOcc>(
             for &(vqid, new_bud, _cost) in &base_survivors[bi] {
                 let mm_used = max_mm - new_bud;
                 let score = SCORE_LUT[mm_used as usize];
+                let fwd = vqid & 1 == 0;
                 for sa_idx in nl as usize..nr_exc as usize {
                     let sa_pos = index.sa(sa_idx);
                     if chroms.is_valid(sa_pos, query_len) {
-                        hits.push(vqid >> 1, sa_pos as u32, score);
+                        hits.push(vqid >> 1, sa_pos as u32, fwd, score);
                     }
                 }
             }
@@ -790,22 +904,167 @@ fn dispatch_survivors<I: FmOcc>(
     }
 }
 
-/// One depth step with lineage-based deduplication — 4-way SIMD vectorized.
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Vertical SIMD Automaton — AVX2 256-bit mismatch budget tracking
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Vertical SIMD Automaton: processes up to 256 work items per cycle using AVX2.
+/// Collapses the O(W) scalar per-item branch into O(1) SIMD transitions per
+/// child base.
 ///
-/// On x86_64 with `InterleavedRank`, the inner loop uses 128-bit SSE2 registers
-/// to compute all 4 child bases simultaneously per work item:
+/// **Match Mask Precomputation**: Four 256-bit registers (M_A, M_C, M_G, M_T)
+/// encode which query's character at the current depth is each nucleotide.
+/// Bit i is set in M_x iff `work_items[i].target_char == x`.
 ///
-/// 1. **SIMD LF mapping**: 2 × `_mm_loadu_si128` + 2 × `_mm_add_epi32` replaces
-///    8 scalar occ() calls. Loads exactly 2 cache lines per (l,r) group.
+/// **Budget State**: Four 256-bit registers (R_0..R_3) encode mismatch budget.
+/// Bit i is set in R_j iff `work_items[i].budget >= j`.
 ///
-/// 2. **Branchless 4-way cost**: `_mm_cmpeq_epi32` + `_mm_andnot_si128` computes
-///    mismatch costs for all 4 bases in one instruction pair. No scalar loop.
+/// **Recurrence** (per child base c, budget-remaining semantics):
+///   R'_3 = R_3 & M_c                        (budget=3 survives only on match)
+///   R'_2 = (R_2 & M_c) | (R_3 & ~M_c)      (match keeps 2, mismatch demotes 3→2)
+///   R'_1 = (R_1 & M_c) | (R_2 & ~M_c)      (match keeps 1, mismatch demotes 2→1)
+///   R'_0 = (R_0 & M_c) | (R_1 & ~M_c)      (match keeps 0, mismatch demotes 1→0)
 ///
-/// 3. **Bitmask survivor filtering**: `_mm_movemask_ps` extracts a 4-bit integer
-///    encoding which bases survive the budget check. Scatter via `trailing_zeros`.
+/// **13-register map** (of 16 YMM):
+///   ymm0-3:  M_A, M_C, M_G, M_T  (match masks, read-only after setup)
+///   ymm4-7:  R_0, R_1, R_2, R_3  (budget state, read-only per group)
+///   ymm8:    all-ones constant    (for NOT via XOR)
+///   ymm9:    M_c                  (selected match mask for current base)
+///   ymm10:   ~M_c                 (complement)
+///   ymm11:   scratch              (recurrence temporaries)
+///   ymm12:   scratch / any        (union for testz pruning)
 ///
-/// 4. **Double-lookahead prefetch**: Issues `_MM_HINT_T0` (L1) for next group and
-///    `_MM_HINT_T1` (L2) for the group after, hiding DRAM latency behind compute.
+/// **Branchless pruning**: `_mm256_testz_si256(any, any)` prunes dead children
+/// in one instruction — no branch misprediction.
+///
+/// **Survivor extraction**: store 256-bit register to `[u64; 4]`, iterate only
+/// set bits via `trailing_zeros()` + `word &= word - 1`. Loop count equals
+/// survivor count, not 256.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vertical_automaton_avx2(
+    work_items: &[WorkItem],
+    alive_mask: i32,
+    base_survivors: &mut [Vec<(u32, u8, u8)>; 4],
+) {
+    use std::arch::x86_64::*;
+
+    let w = work_items.len();
+    if w == 0 { return; }
+
+    let mut chunk_base = 0;
+    while chunk_base < w {
+        let chunk_end = (chunk_base + 256).min(w);
+        let chunk_len = chunk_end - chunk_base;
+        let chunk = &work_items[chunk_base..chunk_end];
+
+        // ── Match Mask Precomputation ────────────────────────────────
+        let mut ma = [0u64; 4];
+        let mut mc = [0u64; 4];
+        let mut mg = [0u64; 4];
+        let mut mt = [0u64; 4];
+        let mut b0 = [0u64; 4];
+        let mut b1 = [0u64; 4];
+        let mut b2 = [0u64; 4];
+        let mut b3 = [0u64; 4];
+
+        for (i, item) in chunk.iter().enumerate() {
+            let word = i >> 6;
+            let bit = 1u64 << (i & 63);
+            match item.target_char {
+                b'A' => ma[word] |= bit,
+                b'C' => mc[word] |= bit,
+                b'G' => mg[word] |= bit,
+                _    => mt[word] |= bit,
+            }
+            // R_j: bit set iff budget >= j. max_mm ≤ 3, so 4 levels.
+            // When max_mm == 0, only b0 is populated; b1..b3 stay zero.
+            b0[word] |= bit;
+            if item.budget >= 1 { b1[word] |= bit; }
+            if item.budget >= 2 { b2[word] |= bit; }
+            if item.budget >= 3 { b3[word] |= bit; }
+        }
+
+        // ymm0-3: match masks
+        let m_masks: [__m256i; 4] = [
+            _mm256_loadu_si256(ma.as_ptr() as *const __m256i),
+            _mm256_loadu_si256(mc.as_ptr() as *const __m256i),
+            _mm256_loadu_si256(mg.as_ptr() as *const __m256i),
+            _mm256_loadu_si256(mt.as_ptr() as *const __m256i),
+        ];
+        // ymm4-7: budget state
+        let r0 = _mm256_loadu_si256(b0.as_ptr() as *const __m256i);
+        let r1 = _mm256_loadu_si256(b1.as_ptr() as *const __m256i);
+        let r2 = _mm256_loadu_si256(b2.as_ptr() as *const __m256i);
+        let r3 = _mm256_loadu_si256(b3.as_ptr() as *const __m256i);
+        // ymm8: all-ones for NOT
+        let all_ones = _mm256_set1_epi64x(-1i64);
+
+        // ── Per-base recurrence + branchless pruning ─────────────────
+        for bi in 0..4usize {
+            if alive_mask & (1 << bi) == 0 { continue; }
+
+            let m_c = m_masks[bi];                              // ymm9
+            let not_mc = _mm256_xor_si256(m_c, all_ones);      // ymm10
+
+            // Budget-remaining recurrence: mismatch demotes from j+1.
+            // R'_3 = R_3 & M_c
+            let r3_new = _mm256_and_si256(r3, m_c);
+            // R'_2 = (R_2 & M_c) | (R_3 & ~M_c)
+            let r2_new = _mm256_or_si256(
+                _mm256_and_si256(r2, m_c),
+                _mm256_and_si256(r3, not_mc),
+            );
+            // R'_1 = (R_1 & M_c) | (R_2 & ~M_c)
+            let r1_new = _mm256_or_si256(
+                _mm256_and_si256(r1, m_c),
+                _mm256_and_si256(r2, not_mc),
+            );
+            // R'_0 = (R_0 & M_c) | (R_1 & ~M_c)
+            let r0_new = _mm256_or_si256(
+                _mm256_and_si256(r0, m_c),
+                _mm256_and_si256(r1, not_mc),
+            );
+
+            // Branchless prune: any survivors?
+            let any = _mm256_or_si256(
+                _mm256_or_si256(r0_new, r1_new),
+                _mm256_or_si256(r2_new, r3_new),
+            );
+            if _mm256_testz_si256(any, any) != 0 { continue; }
+
+            // ── Survivor extraction via trailing_zeros bit scan ──
+            let mut surv = [0u64; 4];
+            _mm256_storeu_si256(surv.as_mut_ptr() as *mut __m256i, any);
+            let mut not_mc_bits = [0u64; 4];
+            _mm256_storeu_si256(not_mc_bits.as_mut_ptr() as *mut __m256i, not_mc);
+
+            for qword in 0..4usize {
+                let mut bits = surv[qword];
+                while bits != 0 {
+                    let bit_pos = bits.trailing_zeros() as usize;
+                    let idx = qword * 64 + bit_pos;
+                    if idx >= chunk_len { break; }
+                    let item = &chunk[idx];
+                    let cost = ((not_mc_bits[qword] >> bit_pos) & 1) as u8;
+                    base_survivors[bi].push((item.vqid, item.budget - cost, cost));
+                    bits &= bits - 1; // clear lowest set bit
+                }
+            }
+        }
+
+        chunk_base = chunk_end;
+    }
+}
+
+/// One depth step with lineage-based deduplication — SIMD vectorized.
+///
+/// On x86_64 with AVX2: dispatches to `vertical_automaton_avx2` which processes
+/// up to 256 work items per cycle using the vertical SIMD mismatch recurrence.
+/// Falls back to per-item SSE2 survivor computation without AVX2.
+///
+/// LF mapping uses SSE2 (128-bit) or BlockRank for cache-line-aligned rank queries.
+/// Double-lookahead prefetch hides DRAM latency behind compute.
 ///
 /// Falls back to scalar path on non-x86_64 or if `rank_data()` returns `None`.
 pub fn step_depth_dedup<I: FmOcc>(
@@ -821,6 +1080,7 @@ pub fn step_depth_dedup<I: FmOcc>(
     next: &mut SearchFrontier,
     lineage: &mut LineageTable,
     clog_vqids: &mut Vec<u32>,
+    ws: &mut StepWorkspace,
 ) {
     let n = frontier.len();
     if n == 0 {
@@ -832,16 +1092,20 @@ pub fn step_depth_dedup<I: FmOcc>(
     let is_terminal = depth + 1 == query_len;
     let seqs: [&[Vec<u8>]; 2] = [queries_fwd, queries_rc];
 
-    // ── Sort frontier by (l, r) to compute LF mapping once per unique pair ──
-    let mut order: Vec<u32> = (0..n as u32).collect();
+    // ── Sort frontier by (l, r) — zero-alloc via workspace reuse ────────
+    let mut order = std::mem::take(&mut ws.order);
+    order.clear();
+    order.extend(0..n as u32);
     order.sort_unstable_by(|&a, &b| {
         let (a, b) = (a as usize, b as usize);
         frontier.l[a].cmp(&frontier.l[b])
             .then(frontier.r[a].cmp(&frontier.r[b]))
     });
 
-    // ── Precompute group boundaries for double-lookahead prefetch ────────
-    let mut group_starts: Vec<usize> = vec![0];
+    // ── Precompute group boundaries — zero-alloc via workspace reuse ────
+    let mut group_starts = std::mem::take(&mut ws.group_starts);
+    group_starts.clear();
+    group_starts.push(0);
     for i in 1..n {
         let prev = order[i - 1] as usize;
         let curr = order[i] as usize;
@@ -858,15 +1122,30 @@ pub fn step_depth_dedup<I: FmOcc>(
         [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
     // ══════════════════════════════════════════════════════════════════════
-    //  SIMD fast path (x86_64 only, requires InterleavedRank)
+    //  SIMD fast path (x86_64 only)
+    //  Supports two rank layouts via RankMode:
+    //    - Blocks: 64-byte cache-line-aligned RankBlocks (12 MB, L3-resident)
+    //    - Flat: legacy interleaved u32 array (192 MB, DRAM-bound)
     // ══════════════════════════════════════════════════════════════════════
     #[cfg(target_arch = "x86_64")]
     {
-        if let Some((rank_slice, less_tbl)) = index.rank_data() {
+        enum RankMode<'a> {
+            Blocks(&'a [RankBlock]),
+            Flat(*const u32),
+        }
+
+        let mode_and_less: Option<(RankMode<'_>, &[usize; 256])> =
+            if let Some((blocks, less_tbl)) = index.rank_blocks() {
+                Some((RankMode::Blocks(blocks), less_tbl))
+            } else if let Some((data, less_tbl)) = index.rank_data() {
+                Some((RankMode::Flat(data.as_ptr()), less_tbl))
+            } else {
+                None
+            };
+
+        if let Some((ref rank_mode, less_tbl)) = mode_and_less {
             unsafe {
                 use std::arch::x86_64::*;
-
-                let rank_ptr = rank_slice.as_ptr();
 
                 // SIMD constants — computed once, reused every group.
                 let less_v = _mm_set_epi32(
@@ -877,6 +1156,7 @@ pub fn step_depth_dedup<I: FmOcc>(
                 );
                 let bases_idx_v = _mm_set_epi32(3, 2, 1, 0);
                 let ones_v = _mm_set1_epi32(1);
+                let has_avx2 = is_x86_feature_detected!("avx2");
 
                 for g in 0..n_groups {
                     let gi = group_starts[g];
@@ -889,19 +1169,39 @@ pub fn step_depth_dedup<I: FmOcc>(
                         let ngi = group_starts[g + 1];
                         let nl = frontier.l[order[ngi] as usize] as usize;
                         let nr = frontier.r[order[ngi] as usize] as usize;
-                        if nl > 0 {
-                            _mm_prefetch(rank_ptr.add((nl - 1) * 4) as *const i8, _MM_HINT_T0);
+                        match rank_mode {
+                            RankMode::Blocks(blocks) => {
+                                if nl > 0 {
+                                    _mm_prefetch(&blocks[(nl - 1) / BLOCK_SIZE] as *const _ as *const i8, _MM_HINT_T0);
+                                }
+                                _mm_prefetch(&blocks[nr / BLOCK_SIZE] as *const _ as *const i8, _MM_HINT_T0);
+                            }
+                            RankMode::Flat(rank_ptr) => {
+                                if nl > 0 {
+                                    _mm_prefetch(rank_ptr.add((nl - 1) * 4) as *const i8, _MM_HINT_T0);
+                                }
+                                _mm_prefetch(rank_ptr.add(nr * 4) as *const i8, _MM_HINT_T0);
+                            }
                         }
-                        _mm_prefetch(rank_ptr.add(nr * 4) as *const i8, _MM_HINT_T0);
                     }
                     if g + 2 < n_groups {
                         let fgi = group_starts[g + 2];
                         let fl = frontier.l[order[fgi] as usize] as usize;
                         let fr = frontier.r[order[fgi] as usize] as usize;
-                        if fl > 0 {
-                            _mm_prefetch(rank_ptr.add((fl - 1) * 4) as *const i8, _MM_HINT_T1);
+                        match rank_mode {
+                            RankMode::Blocks(blocks) => {
+                                if fl > 0 {
+                                    _mm_prefetch(&blocks[(fl - 1) / BLOCK_SIZE] as *const _ as *const i8, _MM_HINT_T1);
+                                }
+                                _mm_prefetch(&blocks[fr / BLOCK_SIZE] as *const _ as *const i8, _MM_HINT_T1);
+                            }
+                            RankMode::Flat(rank_ptr) => {
+                                if fl > 0 {
+                                    _mm_prefetch(rank_ptr.add((fl - 1) * 4) as *const i8, _MM_HINT_T1);
+                                }
+                                _mm_prefetch(rank_ptr.add(fr * 4) as *const i8, _MM_HINT_T1);
+                            }
                         }
-                        _mm_prefetch(rank_ptr.add(fr * 4) as *const i8, _MM_HINT_T1);
                     }
 
                     // ── Build work_items ─────────────────────────────────
@@ -917,13 +1217,27 @@ pub fn step_depth_dedup<I: FmOcc>(
                         }
                     }
 
-                    // ── SIMD LF mapping: 2 × 128-bit loads + 2 adds ─────
-                    let occ_l_v = if l > 0 {
-                        _mm_loadu_si128(rank_ptr.add((l - 1) * 4) as *const __m128i)
-                    } else {
-                        _mm_setzero_si128()
+                    // ── SIMD LF mapping ──────────────────────────────────
+                    let (occ_l_v, occ_r_v) = match rank_mode {
+                        RankMode::Blocks(blocks) => {
+                            let occ_l = if l > 0 {
+                                rank_all_blocks_sse(blocks, l - 1)
+                            } else {
+                                _mm_setzero_si128()
+                            };
+                            let occ_r = rank_all_blocks_sse(blocks, r);
+                            (occ_l, occ_r)
+                        }
+                        RankMode::Flat(rank_ptr) => {
+                            let occ_l = if l > 0 {
+                                _mm_loadu_si128(rank_ptr.add((l - 1) * 4) as *const __m128i)
+                            } else {
+                                _mm_setzero_si128()
+                            };
+                            let occ_r = _mm_loadu_si128(rank_ptr.add(r * 4) as *const __m128i);
+                            (occ_l, occ_r)
+                        }
                     };
-                    let occ_r_v = _mm_loadu_si128(rank_ptr.add(r * 4) as *const __m128i);
 
                     let nl_v = _mm_add_epi32(less_v, occ_l_v);
                     let nr_v = _mm_add_epi32(less_v, occ_r_v);
@@ -941,33 +1255,40 @@ pub fn step_depth_dedup<I: FmOcc>(
 
                     for buf in base_survivors.iter_mut() { buf.clear(); }
 
-                    // ── 4-way SIMD survivor computation per work_item ────
-                    for item in &work_items {
-                        let tidx = base_char_to_idx(item.target_char) as i32;
-                        let target_v = _mm_set1_epi32(tidx);
-                        let match_v = _mm_cmpeq_epi32(target_v, bases_idx_v);
-                        let cost_v = _mm_andnot_si128(match_v, ones_v);
+                    // ── Vertical SIMD Automaton (AVX2) / SSE2 fallback ───
+                    if has_avx2 {
+                        vertical_automaton_avx2(
+                            &work_items, alive_mask,
+                            &mut base_survivors,
+                        );
+                    } else {
+                        for item in &work_items {
+                            let tidx = base_char_to_idx(item.target_char) as i32;
+                            let target_v = _mm_set1_epi32(tidx);
+                            let match_v = _mm_cmpeq_epi32(target_v, bases_idx_v);
+                            let cost_v = _mm_andnot_si128(match_v, ones_v);
 
-                        let budget_v = _mm_set1_epi32(item.budget as i32);
-                        let remaining_v = _mm_sub_epi32(budget_v, cost_v);
+                            let budget_v = _mm_set1_epi32(item.budget as i32);
+                            let remaining_v = _mm_sub_epi32(budget_v, cost_v);
 
-                        let over_budget =
-                            _mm_cmpgt_epi32(_mm_setzero_si128(), remaining_v);
-                        let viable_v = _mm_andnot_si128(over_budget, alive_v);
+                            let over_budget =
+                                _mm_cmpgt_epi32(_mm_setzero_si128(), remaining_v);
+                            let viable_v = _mm_andnot_si128(over_budget, alive_v);
 
-                        let mask = _mm_movemask_ps(_mm_castsi128_ps(viable_v)) as u32;
-                        if mask == 0 { continue; }
+                            let mask = _mm_movemask_ps(_mm_castsi128_ps(viable_v)) as u32;
+                            if mask == 0 { continue; }
 
-                        let mut rem = [0i32; 4];
-                        _mm_storeu_si128(rem.as_mut_ptr() as *mut __m128i, remaining_v);
-                        let mut costs = [0i32; 4];
-                        _mm_storeu_si128(costs.as_mut_ptr() as *mut __m128i, cost_v);
+                            let mut rem = [0i32; 4];
+                            _mm_storeu_si128(rem.as_mut_ptr() as *mut __m128i, remaining_v);
+                            let mut costs = [0i32; 4];
+                            _mm_storeu_si128(costs.as_mut_ptr() as *mut __m128i, cost_v);
 
-                        let mut m = mask;
-                        while m != 0 {
-                            let bi = m.trailing_zeros() as usize;
-                            base_survivors[bi].push((item.vqid, rem[bi] as u8, costs[bi] as u8));
-                            m &= m - 1;
+                            let mut m = mask;
+                            while m != 0 {
+                                let bi = m.trailing_zeros() as usize;
+                                base_survivors[bi].push((item.vqid, rem[bi] as u8, costs[bi] as u8));
+                                m &= m - 1;
+                            }
                         }
                     }
 
@@ -1041,6 +1362,10 @@ pub fn step_depth_dedup<I: FmOcc>(
     if !is_terminal && next.len() > 1 {
         dedup_frontier(next, lineage);
     }
+
+    // Return buffers to workspace (capacity preserved for next depth step).
+    ws.order = order;
+    ws.group_starts = group_starts;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1069,15 +1394,18 @@ fn verify_leading_seeds(
     use rayon::prelude::*;
 
     let k = pos_table.k();
-    let seed_mm = max_mm.min(1);
+    // Dynamic seed_mm based on K vs query_len overlap:
+    //   Non-overlapping (2K ≤ L): seed_mm=1 suffices by pigeonhole
+    //   Overlapping (2K > L):     seed_mm=2 needed for coverage
+    let seed_mm = if k * 2 <= query_len { max_mm.min(1) } else { max_mm.min(2) };
     let text_len = genome_text.len();
     let n_queries = queries_fwd.len();
 
-    // Process queries in parallel; each thread collects (qid, pos, score).
-    let chunk_results: Vec<Vec<(u32, u32, f32)>> = (0..n_queries)
+    // Process queries in parallel; each thread collects (qid, pos, strand, score).
+    let chunk_results: Vec<Vec<(u32, u32, bool, f32)>> = (0..n_queries)
         .into_par_iter()
         .map(|qid| {
-            let mut local_hits: Vec<(u32, u32, f32)> = Vec::new();
+            let mut local_hits: Vec<(u32, u32, bool, f32)> = Vec::new();
             let mut variants: Vec<(usize, u8)> = Vec::with_capacity(64);
 
             // Forward strand: leading K-mer = query_fwd[0..K]
@@ -1101,7 +1429,7 @@ fn verify_leading_seeds(
                         }
                     }
                     if ok {
-                        local_hits.push((qid as u32, start as u32, SCORE_LUT[mm as usize]));
+                        local_hits.push((qid as u32, start as u32, true, SCORE_LUT[mm as usize]));
                     }
                 }
             }
@@ -1127,7 +1455,7 @@ fn verify_leading_seeds(
                         }
                     }
                     if ok {
-                        local_hits.push((qid as u32, start as u32, SCORE_LUT[mm as usize]));
+                        local_hits.push((qid as u32, start as u32, false, SCORE_LUT[mm as usize]));
                     }
                 }
             }
@@ -1138,8 +1466,8 @@ fn verify_leading_seeds(
 
     // Merge all thread-local results into the accumulator.
     for local in chunk_results {
-        for (qi, pos, score) in local {
-            hits.push(qi, pos, score);
+        for (qi, pos, strand, score) in local {
+            hits.push(qi, pos, strand, score);
         }
     }
 }
@@ -1164,11 +1492,11 @@ fn verify_leading_seeds_targeted(
     let seed_mm = max_mm; // full mismatch budget for clog recovery
     let text_len = genome_text.len();
 
-    let chunk_results: Vec<Vec<(u32, u32, f32)>> = clog_qids
+    let chunk_results: Vec<Vec<(u32, u32, bool, f32)>> = clog_qids
         .par_iter()
         .map(|&qid| {
             let qid = qid as usize;
-            let mut local_hits: Vec<(u32, u32, f32)> = Vec::new();
+            let mut local_hits: Vec<(u32, u32, bool, f32)> = Vec::new();
             let mut variants: Vec<(usize, u8)> = Vec::with_capacity(4096);
 
             // Forward strand
@@ -1191,7 +1519,7 @@ fn verify_leading_seeds_targeted(
                         }
                     }
                     if ok {
-                        local_hits.push((qid as u32, start as u32, SCORE_LUT[mm as usize]));
+                        local_hits.push((qid as u32, start as u32, true, SCORE_LUT[mm as usize]));
                     }
                 }
             }
@@ -1216,7 +1544,7 @@ fn verify_leading_seeds_targeted(
                         }
                     }
                     if ok {
-                        local_hits.push((qid as u32, start as u32, SCORE_LUT[mm as usize]));
+                        local_hits.push((qid as u32, start as u32, false, SCORE_LUT[mm as usize]));
                     }
                 }
             }
@@ -1226,8 +1554,8 @@ fn verify_leading_seeds_targeted(
         .collect();
 
     for local in chunk_results {
-        for (qi, pos, score) in local {
-            hits.push(qi, pos, score);
+        for (qi, pos, strand, score) in local {
+            hits.push(qi, pos, strand, score);
         }
     }
 }
@@ -1248,7 +1576,10 @@ fn verify_trailing_seeds(
     hits: &mut HitAccumulator,
 ) {
     let k = pos_table.k();
-    let seed_mm = max_mm.min(1);
+    // Dynamic seed_mm based on K vs query_len overlap:
+    //   Non-overlapping (2K ≤ L): seed_mm=1 suffices by pigeonhole
+    //   Overlapping (2K > L):     seed_mm=2 needed for coverage
+    let seed_mm = if k * 2 <= query_len { max_mm.min(1) } else { max_mm.min(2) };
     let text_len = genome_text.len();
     let prefix_len = query_len - k; // offset from alignment start to trailing K-mer
 
@@ -1279,7 +1610,7 @@ fn verify_trailing_seeds(
                     }
                 }
                 if ok {
-                    hits.push(qid as u32, start as u32, SCORE_LUT[mm as usize]);
+                    hits.push(qid as u32, start as u32, true, SCORE_LUT[mm as usize]);
                 }
             }
         }
@@ -1307,7 +1638,7 @@ fn verify_trailing_seeds(
                     }
                 }
                 if ok {
-                    hits.push(qid as u32, start as u32, SCORE_LUT[mm as usize]);
+                    hits.push(qid as u32, start as u32, false, SCORE_LUT[mm as usize]);
                 }
             }
         }
@@ -1327,19 +1658,23 @@ fn dedup_hits(hits: &mut HitAccumulator) {
     idx.sort_unstable_by(|&a, &b| {
         hits.query_id[a].cmp(&hits.query_id[b])
             .then(hits.position[a].cmp(&hits.position[b]))
+            .then(hits.strand[a].cmp(&hits.strand[b]))
     });
 
     let mut new_qi = Vec::with_capacity(n);
     let mut new_pos = Vec::with_capacity(n);
+    let mut new_strand = Vec::with_capacity(n);
     let mut new_score = Vec::with_capacity(n);
 
     let mut prev_qi = u32::MAX;
     let mut prev_pos = u32::MAX;
+    let mut prev_strand = false;
 
     for &i in &idx {
         let qi = hits.query_id[i];
         let pos = hits.position[i];
-        if qi == prev_qi && pos == prev_pos {
+        let strand = hits.strand[i];
+        if qi == prev_qi && pos == prev_pos && strand == prev_strand {
             // Duplicate — keep best score (highest = fewest mismatches).
             let last = new_score.len() - 1;
             if hits.score[i] > new_score[last] {
@@ -1349,13 +1684,16 @@ fn dedup_hits(hits: &mut HitAccumulator) {
         }
         new_qi.push(qi);
         new_pos.push(pos);
+        new_strand.push(strand);
         new_score.push(hits.score[i]);
         prev_qi = qi;
         prev_pos = pos;
+        prev_strand = strand;
     }
 
     hits.query_id = new_qi;
     hits.position = new_pos;
+    hits.strand = new_strand;
     hits.score = new_score;
 }
 
@@ -1404,7 +1742,10 @@ pub fn search_width_first_seeded<I: FmOcc>(
     // which together with this phase satisfies the pigeonhole principle:
     // for max_mm mismatches across 2 segments, at least one has ≤ floor(max_mm/2).
 
-    let seed_mm = max_mm.min(1);
+    // Dynamic seed_mm based on K vs query_len overlap:
+    //   Non-overlapping (2K ≤ L): seed_mm=1 suffices by pigeonhole
+    //   Overlapping (2K > L):     seed_mm=2 needed for coverage
+    let seed_mm = if k * 2 <= query_len { max_mm.min(1) } else { max_mm.min(2) };
     let n_queries = queries_fwd.len();
     let mut seed_l = Vec::new();
     let mut seed_r = Vec::new();
@@ -1448,12 +1789,13 @@ pub fn search_width_first_seeded<I: FmOcc>(
         for i in 0..initial_size {
             let mm_used = max_mm - seed_bud[i];
             let score = SCORE_LUT[mm_used as usize];
+            let fwd = seed_str[i] != 0;
             let lo = seed_l[i] as usize;
             let hi = seed_r[i] as usize + 1;
             for sa_idx in lo..hi {
                 let sa_pos = index.sa(sa_idx);
                 if chroms.is_valid(sa_pos, query_len) {
-                    hits.push(seed_qid[i], sa_pos as u32, score);
+                    hits.push(seed_qid[i], sa_pos as u32, fwd, score);
                 }
             }
         }
@@ -1534,11 +1876,12 @@ fn search_inmemory_from_seeds<I: FmOcc>(
         a.push(sl[i], sr[i], sb[i], sq[i], ss[i]);
     }
     let mut b = SearchFrontier::with_capacity(n * 2);
+    let mut ws = StepWorkspace::new();
 
     for depth in start_depth..query_len {
         step_depth(
             index, &a, depth, query_len, queries_fwd, queries_rc,
-            max_mm, chroms, hits, &mut b,
+            max_mm, chroms, hits, &mut b, &mut ws,
         );
         std::mem::swap(&mut a, &mut b);
     }
@@ -1574,11 +1917,13 @@ fn search_dedup_from_seeds<I: FmOcc>(
 
     let mut b = SearchFrontier::with_capacity(a.len() * 2);
     let mut clog_vqids: Vec<u32> = Vec::new();
+    let mut ws = StepWorkspace::new();
 
     for depth in start_depth..query_len {
         step_depth_dedup(
             index, &a, depth, query_len, queries_fwd, queries_rc,
             max_mm, chroms, hits, &mut b, &mut lineage, &mut clog_vqids,
+            &mut ws,
         );
         std::mem::swap(&mut a, &mut b);
     }
@@ -1641,11 +1986,12 @@ fn search_short_queries<I: FmOcc>(
     let sa_len = index.sa_len() as u32;
     let mut a = SearchFrontier::seed(queries_fwd.len(), sa_len, max_mm);
     let mut b = SearchFrontier::with_capacity(a.len() * 2);
+    let mut ws = StepWorkspace::new();
 
     for depth in 0..query_len {
         step_depth(
             index, &a, depth, query_len, queries_fwd, queries_rc,
-            max_mm, chroms, hits, &mut b,
+            max_mm, chroms, hits, &mut b, &mut ws,
         );
         std::mem::swap(&mut a, &mut b);
     }
@@ -1671,11 +2017,12 @@ pub fn search_width_first<I: FmOcc>(
     let sa_len = index.sa_len() as u32;
     let mut a = SearchFrontier::seed(queries_fwd.len(), sa_len, max_mm);
     let mut b = SearchFrontier::with_capacity(a.len() * 2);
+    let mut ws = StepWorkspace::new();
 
     for depth in 0..query_len {
         step_depth(
             index, &a, depth, query_len, queries_fwd, queries_rc,
-            max_mm, chroms, hits, &mut b,
+            max_mm, chroms, hits, &mut b, &mut ws,
         );
         std::mem::swap(&mut a, &mut b);
     }

@@ -2,7 +2,7 @@
 
 import time
 from pathlib import Path
-from seqchain_native import FmIndex
+from needletail import FmIndex
 
 FASTA = str(Path.home() / "Git/SeqChain/tests/data/saccer3/sacCer3.fa")
 

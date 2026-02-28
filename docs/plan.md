@@ -1,8 +1,8 @@
-# Plan: seqchain-native — N-API + Strand FM-Index Addon
+# Plan: needletail — N-API + Strand FM-Index Addon
 
 ## Context
 
-`seqchain-native` is a new native Node-API addon that bridges Node.js directly to a
+`needletail` is a new native Node-API addon that bridges Node.js directly to a
 `rust-bio` FM-Index via the Strand `SharedArrayBuffer` protocol. The alternative
 approaches (`subprocess.Popen` with SAM stdout parsing, or WASM) impose either process
 isolation overhead or a 32-bit / 4GB memory ceiling. The native addon loads into the
@@ -63,7 +63,7 @@ live SAB header (FNV-1a of the Strand binary schema descriptor).
 ## File Structure
 
 ```
-seqchain-native/
+needletail/
 ├── package.json          # napi-rs CLI devDep, build + test scripts
 ├── Cargo.toml            # [lib] crate-type = ["cdylib"]
 ├── build.rs              # napi-rs build script
@@ -256,7 +256,7 @@ The async task body:
 
 ```json
 {
-  "name": "seqchain-native",
+  "name": "needletail",
   "version": "0.1.0",
   "main": "index.js",
   "scripts": {
@@ -331,14 +331,14 @@ stops advancing) and resumes when consumer unblocks.
 
 ```bash
 # 0. Prerequisite: build @strand/core so dist/ exists (no npm publish needed —
-#    seqchain-native references it via file:../strand in package.json)
-cd ~/Git/strand && npm run build && cd ~/Git/seqchain-native
+#    needletail references it via file:../strand in package.json)
+cd ~/Git/strand && npm run build && cd ~/Git/needletail
 
 # 1. Install JS tooling
 npm install
 
 # 2. Compile Rust addon
-npm run build          # → seqchain-native.linux-x64-gnu.node
+npm run build          # → needletail.linux-x64-gnu.node
 
 # 3. Run integration tests
 npm test

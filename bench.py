@@ -4,7 +4,7 @@ import time
 import subprocess
 import tempfile
 import os
-from seqchain_native import FmIndex
+from needletail import FmIndex
 
 FASTA = os.path.expanduser("~/Git/SeqChain/tests/data/saccer3/sacCer3.fa")
 
@@ -73,9 +73,9 @@ def main():
     print(f"  Built in {build_s:.2f}s — {len(chroms)} chromosomes")
     print()
 
-    # ── Benchmark: seqchain-native (width-first) ──────────────────────────
+    # ── Benchmark: needletail (width-first) ──────────────────────────
     print("=" * 70)
-    print("seqchain-native (width-first SIMD FM-Index)")
+    print("needletail (width-first SIMD FM-Index)")
     print("=" * 70)
 
     for mm in [0, 1, 2, 3]:
@@ -140,7 +140,7 @@ def main():
     # ── Summary ───────────────────────────────────────────────────────────
     print()
     print("Note: bowtie times include process launch + index load (~20-40ms).")
-    print("seqchain-native times are pure in-process search (index already loaded).")
+    print("needletail times are pure in-process search (index already loaded).")
 
 if __name__ == "__main__":
     main()

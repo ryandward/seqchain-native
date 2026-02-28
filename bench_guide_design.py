@@ -17,9 +17,9 @@ import sys
 from pathlib import Path
 from collections import Counter
 
-from seqchain_native import FmIndex
+from needletail import FmIndex
 
-FASTA = str(Path.home() / "Git/SeqChain/tests/data/saccer3/sacCer3.fa")
+FASTA = str(Path(__file__).parent / "test/fixtures/sacCer3.fa")
 PAM = "TT"          # TTN PAM — we match the TT prefix
 SPACER_LEN = 20
 PAM_LEN = 3         # TTN = 3 bases
@@ -113,12 +113,23 @@ def main():
     print(f"  {len(unique_spacers):,} unique spacers")
     print(f"  Scanned in {t_scan:.2f}s")
 
-    # ── Build FM-Index ────────────────────────────────────────────────────
-    print("\nBuilding FM-Index...", flush=True)
+    # ── Build FM-Index + persist ────────────────────────────────────────
+    index_path = FASTA.rsplit(".", 1)[0] + ".seqchain"
+    print(f"\nBuilding FM-Index + saving to {index_path}...", flush=True)
     t0 = time.perf_counter()
-    idx = FmIndex(FASTA)
+    idx = FmIndex.build(FASTA, index_path)
     t_build = time.perf_counter() - t0
-    print(f"  Built in {t_build:.2f}s")
+    print(f"  Built + saved in {t_build:.2f}s")
+
+    # ── Reload via mmap + warm seeds ─────────────────────────────────────
+    print("\nLoading via mmap + warming seeds...", flush=True)
+    t0 = time.perf_counter()
+    idx = FmIndex.load(index_path)
+    t_load_mmap = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    idx.warm_seeds(index_path)
+    t_warm = time.perf_counter() - t0
+    print(f"  mmap load: {t_load_mmap*1e6:.0f}µs, warm_seeds: {t_warm:.2f}s")
 
     # ── Off-target search ─────────────────────────────────────────────────
     # Process in batches to manage memory.
@@ -132,7 +143,7 @@ def main():
         batches = 0
         for start in range(0, len(unique_spacers), BATCH_SIZE):
             batch = unique_spacers[start : start + BATCH_SIZE]
-            qi, pos, scores = idx.search_batch(batch, mismatches=mm)
+            qi, pos, strand, scores = idx.search_batch(batch, mismatches=mm)
             total_hits += len(qi)
             batches += 1
 
@@ -158,6 +169,8 @@ def main():
     print(f"  Total guides : {len(all_spacers):,}")
     print(f"  Unique spacers: {len(unique_spacers):,}")
     print(f"  Index build  : {t_build:.2f}s")
+    print(f"  mmap load    : {t_load_mmap*1e6:.0f}µs")
+    print(f"  warm_seeds   : {t_warm:.2f}s")
     print(f"  PAM scan     : {t_scan:.2f}s")
     print("=" * 70)
 

@@ -1,10 +1,10 @@
-"""Fair comparison: all-alignments mode for bowtie1/2 vs seqchain-native."""
+"""Fair comparison: all-alignments mode for bowtie1/2 vs needletail."""
 
 import time
 import subprocess
 import tempfile
 import os
-from seqchain_native import FmIndex
+from needletail import FmIndex
 
 FASTA = os.path.expanduser("~/Git/SeqChain/tests/data/saccer3/sacCer3.fa")
 
@@ -64,12 +64,12 @@ def main():
     # Precompute byte arrays
     queries_fwd = [q.upper() for q in QUERIES]
 
-    print(f"{'mm':>3} | {'seqchain-native':>30} | {'bowtie1 -a':>30} | {'bowtie2 -a':>30}")
+    print(f"{'mm':>3} | {'needletail':>30} | {'bowtie1 -a':>30} | {'bowtie2 -a':>30}")
     print(f"{'':>3} | {'hits':>8}  {'µs':>8}  {'µs/q':>8} | {'hits':>8}  {'ms':>10} | {'hits':>8}  {'ms':>10}")
     print("-" * 100)
 
     for mm in [0, 1, 2, 3]:
-        # seqchain-native: warmup + timed
+        # needletail: warmup + timed
         idx.search_batch(QUERIES, mismatches=mm)
         iters = 50
         t0 = time.perf_counter_ns()
@@ -92,7 +92,7 @@ def main():
 
     # ── Scale comparison: 1000 queries ────────────────────────────────────
     print()
-    print("Scale: 1000 queries × 3mm (seqchain-native only — bowtie too slow for all-hits)")
+    print("Scale: 1000 queries × 3mm (needletail only — bowtie too slow for all-hits)")
     queries_1k = QUERIES * 167  # ~1000
     # Warmup
     idx.search_batch(queries_1k[:100], mismatches=3)

@@ -1,8 +1,8 @@
-# seqchain-native — Assessment and SeqChain Integration
+# needletail — Assessment and SeqChain Integration
 
 ## What it is
 
-seqchain-native is a Node.js N-API addon that builds a rust-bio FM-Index from a FASTA
+needletail is a Node.js N-API addon that builds a rust-bio FM-Index from a FASTA
 file and streams alignment records into a Strand SharedArrayBuffer. It exposes one
 constructor (`NativeFmIndex(fasta)`) and one async method (`streamAlignments`). Results
 land in a Strand ring buffer and are consumed by the JS caller through `StrandView`.
@@ -17,24 +17,24 @@ Benchmarked on SacCer3 (11.7 MB, 17 chromosomes). bowtie1 v1.3.1, bowtie2 v2.5.4
 
 | Tool            | Build time | Index size | Persists? |
 |-----------------|-----------|------------|-----------|
-| seqchain-native | 1,110 ms  | ~300 MB RAM | No (rebuilt every process start) |
+| needletail | 1,110 ms  | ~300 MB RAM | No (rebuilt every process start) |
 | bowtie1         | 4,468 ms  | 20 MB disk  | Yes (.ebwt files) |
 | bowtie2         | 5,418 ms  | 25 MB disk  | Yes (.bt2 files) |
 
-seqchain-native builds faster than either bowtie tool, but the index lives only in RAM
+needletail builds faster than either bowtie tool, but the index lives only in RAM
 and must be rebuilt on every process restart. bowtie pre-builds once and memory-maps the
 index at search time.
 
 ### Search — exact match (0 mismatches)
 
-| Query        | Hits | seqchain-native | bowtie1 | bowtie2 |
+| Query        | Hits | needletail | bowtie1 | bowtie2 |
 |--------------|------|-----------------|---------|---------|
 | unique 20 nt | 1    | 0.09 ms         | 22 ms   | 39 ms   |
 | repeat (Ty)  | 80   | 0.42 ms         | 24 ms   | 45 ms   |
 
 ### Search — 1 mismatch
 
-| Query        | Hits | seqchain-native | bowtie1 | bowtie2 |
+| Query        | Hits | needletail | bowtie1 | bowtie2 |
 |--------------|------|-----------------|---------|---------|
 | unique 20 nt | 1    | 0.14 ms         | 31 ms   | 27 ms   |
 | repeat (Ty)  | 108  | 0.14 ms         | 27 ms   | 41 ms   |
@@ -43,7 +43,7 @@ Hit counts are identical across all three tools.
 
 **Reading the bowtie numbers:** bowtie's wall time is dominated by process launch and
 index load from disk (~20–25 ms), not the actual BWT search. The search itself is
-sub-millisecond in all tools. seqchain-native's advantage is that it runs in-process —
+sub-millisecond in all tools. needletail's advantage is that it runs in-process —
 no fork, no exec, no disk I/O after the index is built.
 
 ---
@@ -66,7 +66,7 @@ RAM requirement.
 
 ---
 
-## What seqchain-native can realistically be
+## What needletail can realistically be
 
 **It fits the SeqChain model for small, bounded genomes** — bacteria (~5 MB),
 yeast (~12 MB), small viruses. The 300 MB index fits comfortably in any modern server.
@@ -78,7 +78,7 @@ zero-copy to the consumer as they are found.
 persistent, memory-mapped index (bowtie's .bt2 files or a similar format) so the OS
 page cache can hold only the used portions. That is a separate design problem.
 
-**The right framing for SeqChain integration:** seqchain-native is the alignment engine
+**The right framing for SeqChain integration:** needletail is the alignment engine
 for the CRISPR library design and transposon off-target workflows in SeqChain. Those
 workflows already target bacterial and yeast genomes. The tool is in scope for those
 use cases and out of scope for mammalian whole-genome alignment.

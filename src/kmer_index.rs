@@ -30,8 +30,13 @@ use memmap2::Mmap;
 
 use crate::simd_search::FmOcc;
 
-/// Default seed length. 4^10 = 1,048,576 entries × 8 bytes = 8 MiB.
-pub const SEED_K: usize = 10;
+/// Small seed length. 4^10 = 1,048,576 entries × 8 bytes = 8 MiB.
+/// Used for mm ≤ 2: non-overlapping segments, seed_mm=1, 43 variants max.
+pub const SEED_K_SMALL: usize = 10;
+
+/// Large seed length. 4^14 = 268,435,456 entries × 8 bytes = 2.1 GiB.
+/// Used for mm = 3: deeper seed shortens BWT to 6 steps, seed_mm=2.
+pub const SEED_K_LARGE: usize = 14;
 
 /// Number of entries in the table: 4^K.
 const fn table_size(k: usize) -> usize {
