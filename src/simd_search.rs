@@ -1034,10 +1034,25 @@ unsafe fn vertical_automaton_avx2(
             if _mm256_testz_si256(any, any) != 0 { continue; }
 
             // ── Survivor extraction via trailing_zeros bit scan ──
-            let mut surv = [0u64; 4];
-            _mm256_storeu_si256(surv.as_mut_ptr() as *mut __m256i, any);
-            let mut not_mc_bits = [0u64; 4];
-            _mm256_storeu_si256(not_mc_bits.as_mut_ptr() as *mut __m256i, not_mc);
+            // Extract qwords directly from YMM registers to avoid
+            // Store-to-Load Forwarding stalls. The _mm256_storeu_si256
+            // → u64 load pattern forces a pipeline drain (~10 cycles)
+            // because the store buffer hasn't committed the 32-byte
+            // YMM write before the 8-byte scalar read at the same
+            // address. _mm256_extract_epi64 reads the register file
+            // directly — zero memory round-trip.
+            let surv = [
+                _mm256_extract_epi64::<0>(any) as u64,
+                _mm256_extract_epi64::<1>(any) as u64,
+                _mm256_extract_epi64::<2>(any) as u64,
+                _mm256_extract_epi64::<3>(any) as u64,
+            ];
+            let not_mc_bits = [
+                _mm256_extract_epi64::<0>(not_mc) as u64,
+                _mm256_extract_epi64::<1>(not_mc) as u64,
+                _mm256_extract_epi64::<2>(not_mc) as u64,
+                _mm256_extract_epi64::<3>(not_mc) as u64,
+            ];
 
             for qword in 0..4usize {
                 let mut bits = surv[qword];
@@ -1048,7 +1063,7 @@ unsafe fn vertical_automaton_avx2(
                     let item = &chunk[idx];
                     let cost = ((not_mc_bits[qword] >> bit_pos) & 1) as u8;
                     base_survivors[bi].push((item.vqid, item.budget - cost, cost));
-                    bits &= bits - 1; // clear lowest set bit
+                    bits &= bits - 1;
                 }
             }
         }
@@ -1158,48 +1173,86 @@ pub fn step_depth_dedup<I: FmOcc>(
                 let ones_v = _mm_set1_epi32(1);
                 let has_avx2 = is_x86_feature_detected!("avx2");
 
+                // ── Software-Pipelined Prefetch (depth = 2) ─────────
+                //
+                // Pipeline structure:
+                //   Prologue: issue T0 prefetches for groups 0 and 1.
+                //   Steady state: at group g, issue T0 for group g+2.
+                //   By the time we compute group g, its RankBlocks were
+                //   prefetched into L1 two iterations ago (or in the
+                //   prologue). ~100–300 cycles of compute per group
+                //   exceeds the ~40–60 cycle L3→L1 promotion latency.
+                //
+                // Address speculation (BlockRank layout):
+                //   block_idx  = pos / BLOCK_SIZE = pos >> 6
+                //   byte_addr  = block_idx × 64   = (pos >> 6) << 6
+                //   Each RankBlock is repr(C, align(64)) — prefetch
+                //   targets are always cache-line aligned (no splits).
+                //
+                // Why T0 everywhere (not T1 for g+2):
+                //   With depth 2, the data has 2 full iterations to
+                //   arrive. T0 places it directly in L1 (0-cycle access
+                //   on hit) vs T1 which stops at L2 (~4-cycle penalty).
+                //   L1 pressure is negligible: 2–4 cache lines (128–256
+                //   bytes) vs 32 KB L1D capacity.
+
+                // Prologue: prime the first 2 groups into L1.
+                for p in 0..n_groups.min(2) {
+                    let pgi = group_starts[p];
+                    let pl = frontier.l[order[pgi] as usize] as usize;
+                    let pr = frontier.r[order[pgi] as usize] as usize;
+                    match rank_mode {
+                        RankMode::Blocks(blocks) => {
+                            if pl > 0 {
+                                _mm_prefetch(
+                                    &blocks[(pl - 1) / BLOCK_SIZE] as *const _ as *const i8,
+                                    _MM_HINT_T0,
+                                );
+                            }
+                            _mm_prefetch(
+                                &blocks[pr / BLOCK_SIZE] as *const _ as *const i8,
+                                _MM_HINT_T0,
+                            );
+                        }
+                        RankMode::Flat(rank_ptr) => {
+                            if pl > 0 {
+                                _mm_prefetch(rank_ptr.add((pl - 1) * 4) as *const i8, _MM_HINT_T0);
+                            }
+                            _mm_prefetch(rank_ptr.add(pr * 4) as *const i8, _MM_HINT_T0);
+                        }
+                    }
+                }
+
                 for g in 0..n_groups {
                     let gi = group_starts[g];
                     let gj = if g + 1 < n_groups { group_starts[g + 1] } else { n };
                     let l = frontier.l[order[gi] as usize] as usize;
                     let r = frontier.r[order[gi] as usize] as usize;
 
-                    // ── Double-lookahead prefetch ────────────────────────
-                    if g + 1 < n_groups {
-                        let ngi = group_starts[g + 1];
-                        let nl = frontier.l[order[ngi] as usize] as usize;
-                        let nr = frontier.r[order[ngi] as usize] as usize;
-                        match rank_mode {
-                            RankMode::Blocks(blocks) => {
-                                if nl > 0 {
-                                    _mm_prefetch(&blocks[(nl - 1) / BLOCK_SIZE] as *const _ as *const i8, _MM_HINT_T0);
-                                }
-                                _mm_prefetch(&blocks[nr / BLOCK_SIZE] as *const _ as *const i8, _MM_HINT_T0);
-                            }
-                            RankMode::Flat(rank_ptr) => {
-                                if nl > 0 {
-                                    _mm_prefetch(rank_ptr.add((nl - 1) * 4) as *const i8, _MM_HINT_T0);
-                                }
-                                _mm_prefetch(rank_ptr.add(nr * 4) as *const i8, _MM_HINT_T0);
-                            }
-                        }
-                    }
+                    // ── Steady state: prefetch g+2 into L1 ──────────
                     if g + 2 < n_groups {
                         let fgi = group_starts[g + 2];
                         let fl = frontier.l[order[fgi] as usize] as usize;
                         let fr = frontier.r[order[fgi] as usize] as usize;
                         match rank_mode {
                             RankMode::Blocks(blocks) => {
+                                // block_addr = (pos >> 6) << 6, 64-byte aligned
                                 if fl > 0 {
-                                    _mm_prefetch(&blocks[(fl - 1) / BLOCK_SIZE] as *const _ as *const i8, _MM_HINT_T1);
+                                    _mm_prefetch(
+                                        &blocks[(fl - 1) / BLOCK_SIZE] as *const _ as *const i8,
+                                        _MM_HINT_T0,
+                                    );
                                 }
-                                _mm_prefetch(&blocks[fr / BLOCK_SIZE] as *const _ as *const i8, _MM_HINT_T1);
+                                _mm_prefetch(
+                                    &blocks[fr / BLOCK_SIZE] as *const _ as *const i8,
+                                    _MM_HINT_T0,
+                                );
                             }
                             RankMode::Flat(rank_ptr) => {
                                 if fl > 0 {
-                                    _mm_prefetch(rank_ptr.add((fl - 1) * 4) as *const i8, _MM_HINT_T1);
+                                    _mm_prefetch(rank_ptr.add((fl - 1) * 4) as *const i8, _MM_HINT_T0);
                                 }
-                                _mm_prefetch(rank_ptr.add(fr * 4) as *const i8, _MM_HINT_T1);
+                                _mm_prefetch(rank_ptr.add(fr * 4) as *const i8, _MM_HINT_T0);
                             }
                         }
                     }
@@ -1304,6 +1357,9 @@ pub fn step_depth_dedup<I: FmOcc>(
             if !is_terminal && next.len() > 1 {
                 dedup_frontier(next, lineage);
             }
+            // Return workspace vectors (capacity preserved for next depth step).
+            ws.order = order;
+            ws.group_starts = group_starts;
             return;
         }
     }
