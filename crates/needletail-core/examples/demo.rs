@@ -7,16 +7,19 @@ use needletail_core::pipeline::design::{design_library, NullProgress};
 use needletail_core::{FmIndexSearcher, IndexHandle, build_seed_tiers};
 
 fn main() {
-    let gb_path = "test/fixtures/zymomonas.gb";
+    let gb_path = std::env::args().nth(1)
+        .unwrap_or_else(|| "test/fixtures/zymomonas.gb".to_string());
 
     let t0 = std::time::Instant::now();
-    let genome = load_genbank(Path::new(gb_path)).unwrap();
+    let genome = load_genbank(Path::new(&gb_path)).unwrap();
     eprintln!("Loaded genome: {} chroms, {} genes ({:.2?})",
         genome.sequences.len(), genome.genes().len(), t0.elapsed());
 
     // Build FM-index from the genome sequences in memory
     // Write a temp FASTA for the FM-index builder
-    let tmp_fa = "/tmp/zymomonas_needletail.fa";
+    let stem = Path::new(&gb_path).file_stem().unwrap().to_string_lossy();
+    let tmp_fa_owned = format!("/tmp/{}_needletail.fa", stem);
+    let tmp_fa = tmp_fa_owned.as_str();
     {
         use std::io::Write;
         let mut f = std::fs::File::create(tmp_fa).unwrap();
