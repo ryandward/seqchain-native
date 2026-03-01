@@ -48,9 +48,9 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let bind = "0.0.0.0:3000";
+    let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into());
     println!("needletail-server listening on {}", bind);
 
-    let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&bind).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
