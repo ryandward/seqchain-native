@@ -1,6 +1,7 @@
 from __future__ import annotations
 from collections import Counter
 from dataclasses import replace
+from itertools import islice
 from typing import TYPE_CHECKING, Iterable, Iterator
 
 if TYPE_CHECKING:
@@ -56,6 +57,9 @@ def scan_guides(
         )
 
 
+_CHUNK_SIZE = 100_000
+
+
 def score_off_targets_fast(
     regions: Iterable[Region],
     index: needletail.FmIndex,
@@ -66,50 +70,64 @@ def score_off_targets_fast(
     mismatches: int = 2,
     topologies: dict[str, str] | None = None,
     max_width: int = 8,
+    chunk_size: int = _CHUNK_SIZE,
+    **kwargs,
 ) -> Iterator[Region]:
-    """Rust-native off-target scoring. PAM validation in Rust, single batch.
+    """Streaming Rust-native off-target scoring with macro-chunking.
 
-    Replaces score_off_targets_native: no chunking, no Python-side PAM regex,
-    no per-hit coordinate math. One search_batch call does everything.
+    Pulls ``chunk_size`` regions at a time from the upstream generator,
+    deduplicates spacers within the chunk, issues a single search_batch
+    call with in-Rust PAM validation, and yields scored Regions one by one.
+
+    Memory: O(chunk_size).  Axis 8 compliant — never materializes the
+    full stream.  The upstream generator is consumed lazily via islice.
+
+    Drop-in replacement for score_off_targets / score_off_targets_native.
+    Extra keyword arguments (e.g. ``sequences``) are accepted and ignored
+    for call-site compatibility.
     """
     topo = topologies or {}
     chrom_names = index.chrom_names()
     topo_flags = [topo.get(n, "linear") == "circular" for n in chrom_names]
 
-    # Materialize regions to extract spacers.
-    chunk = list(regions)
-    if not chunk:
-        return
+    it = iter(regions)
+    while True:
+        chunk = list(islice(it, chunk_size))
+        if not chunk:
+            return
 
-    # Dedup spacers → search unique set once.
-    spacer_to_idx: dict[str, int] = {}
-    unique_spacers: list[str] = []
-    spacer_map: list[int] = []  # region index → unique spacer index
-    for r in chunk:
-        spacer = r.tags.get("spacer", "")
-        if spacer not in spacer_to_idx:
-            spacer_to_idx[spacer] = len(unique_spacers)
-            unique_spacers.append(spacer)
-        spacer_map.append(spacer_to_idx[spacer])
+        # Dedup spacers within this chunk.
+        spacer_to_idx: dict[str, int] = {}
+        unique_spacers: list[str] = []
+        spacer_map: list[int] = []
+        for r in chunk:
+            spacer = r.tags.get("spacer", "")
+            if spacer not in spacer_to_idx:
+                spacer_to_idx[spacer] = len(unique_spacers)
+                unique_spacers.append(spacer)
+            spacer_map.append(spacer_to_idx[spacer])
 
-    # Single Rust call — GIL released, PAM validated in Rust.
-    qi, _pos, _strand, _scores = index.search_batch(
-        unique_spacers,
-        mismatches=mismatches,
-        max_width=max_width,
-        pam=pam,
-        pam_direction=pam_direction,
-        topologies=topo_flags,
-    )
-
-    # Count PAM-valid hits per unique spacer.
-    counts = Counter(qi)
-
-    for i, r in enumerate(chunk):
-        total = counts.get(spacer_map[i], 0)
-        off_targets = max(0, total - 1)
-        yield replace(
-            r,
-            score=float(off_targets),
-            tags={**r.tags, "total_sites": total, "off_targets": off_targets},
+        # Single Rust call per chunk — GIL released, PAM validated in Rust.
+        qi, _pos, _strand, _scores = index.search_batch(
+            unique_spacers,
+            mismatches=mismatches,
+            max_width=max_width,
+            pam=pam,
+            pam_direction=pam_direction,
+            topologies=topo_flags,
         )
+
+        # Count PAM-valid hits per unique spacer.
+        counts = Counter(qi)
+
+        for i, r in enumerate(chunk):
+            total = counts.get(spacer_map[i], 0)
+            off_targets = max(0, total - 1)
+            yield replace(
+                r,
+                score=float(off_targets),
+                tags={**r.tags, "total_sites": total, "off_targets": off_targets},
+            )
+
+        # Explicit cleanup — release chunk memory before next pull.
+        del chunk, spacer_to_idx, unique_spacers, spacer_map, qi, counts
