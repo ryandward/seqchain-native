@@ -1,8 +1,18 @@
+//! Job polling and streaming endpoints.
+//!
+//! ```text
+//! GET    /api/jobs/:id        → status + progress
+//! GET    /api/jobs/:id/stream → result stream (Content-Disposition set)
+//! DELETE /api/jobs/:id        → cancel (best-effort); always 200
+//! ```
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::Response;
 use axum::Json;
 use serde_json::{json, Value};
 
@@ -11,7 +21,7 @@ use needletail_core::io::json::region_to_json;
 use crate::jobs::JobStatus;
 use crate::AppState;
 
-/// Get job status and progress.
+/// Poll job status and progress.
 pub async fn status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -19,32 +29,51 @@ pub async fn status(
     let job = state.jobs.get(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "job not found" })),
+            Json(json!({ "error": "Job not found" })),
         )
     })?;
 
     let status = *job.status.lock().unwrap();
-    let stage = job.progress.stage.lock().unwrap().clone();
-    let current = job.progress.current.load(Ordering::Acquire);
-    let total = job.progress.total.load(Ordering::Acquire);
+    let elapsed = job.elapsed_secs();
 
-    let status_str = match status {
-        JobStatus::Pending => "pending",
-        JobStatus::Running => "running",
-        JobStatus::Completed => "completed",
-        JobStatus::Failed => "failed",
-        JobStatus::Cancelled => "cancelled",
+    let guides_complete = job.guides_complete.load(Ordering::Acquire);
+    let chroms_complete = job.chroms_complete.load(Ordering::Acquire);
+    let chroms_total = job.chroms_total.load(Ordering::Acquire);
+
+    // Compute progress metrics matching SeqChain's format
+    let pct: Option<f64> = if chroms_total > 0 && chroms_complete > 0 {
+        Some((chroms_complete as f64 / chroms_total as f64 * 1000.0).round() / 1000.0)
+    } else {
+        None
     };
 
-    let mut resp = json!({
-        "id": job.id,
-        "genome_id": job.genome_id,
-        "status": status_str,
-        "progress": {
-            "stage": stage,
-            "current": current,
-            "total": total,
+    let rate: Option<f64> = match (elapsed, guides_complete) {
+        (Some(e), gc) if e > 0.0 && gc > 0 => Some((gc as f64 / e * 10.0).round() / 10.0),
+        _ => None,
+    };
+
+    let mut eta: Option<i64> = if let Some(e) = elapsed {
+        if chroms_complete > 0 {
+            let secs_per_chrom = e / chroms_complete as f64;
+            Some((secs_per_chrom * (chroms_total - chroms_complete) as f64).round() as i64)
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    if status == JobStatus::Complete {
+        eta = Some(0);
+    }
+
+    let mut resp = json!({
+        "status": status.as_str(),
+        "progress": {
+            "pct_complete": pct,
+            "rate_per_sec": rate,
+            "eta_seconds": eta,
+        },
+        "error": Value::Null,
     });
 
     if status == JobStatus::Failed {
@@ -53,44 +82,58 @@ pub async fn status(
         }
     }
 
-    if status == JobStatus::Completed {
-        if let Some(Ok(ref result)) = *job.result.lock().unwrap() {
-            resp["summary"] = json!({
-                "n_guides": result.guides.len(),
-                "n_feature_tiles": result.feature_tiles.len(),
-                "total_guides_scored": result.total_guides_scored,
-            });
-        }
-    }
-
     Ok(Json(resp))
 }
 
-/// Stream job results as JSON array.
+/// Stream the completed job result.
+///
+/// Called once by GenomeHub after status reaches "complete".
+/// Returns streaming JSON array with Content-Disposition header.
 pub async fn stream(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Response, (StatusCode, Json<Value>)> {
     let job = state.jobs.get(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "job not found" })),
+            Json(json!({ "error": "Job not found" })),
         )
     })?;
 
     let status = *job.status.lock().unwrap();
-    if status != JobStatus::Completed {
+    if status != JobStatus::Complete {
         return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("job status is {:?}, expected completed", status) })),
+            StatusCode::ACCEPTED,
+            Json(json!({ "error": format!("Job not complete (status: {})", status.as_str()) })),
         ));
     }
 
     let result = job.result.lock().unwrap();
     match result.as_ref() {
         Some(Ok(lib_result)) => {
-            let json_guides: Vec<Value> = lib_result.guides.iter().map(region_to_json).collect();
-            Ok(Json(json!(json_guides)))
+            // Build streaming JSON array
+            let mut chunks: Vec<String> = Vec::with_capacity(lib_result.guides.len() + 2);
+            chunks.push("[".to_string());
+            for (i, guide) in lib_result.guides.iter().enumerate() {
+                let j = region_to_json(guide);
+                if i > 0 {
+                    chunks.push(",".to_string());
+                }
+                chunks.push(serde_json::to_string(&j).unwrap_or_default());
+            }
+            chunks.push("]".to_string());
+
+            let body = chunks.join("");
+            let mut response = Response::new(Body::from(body));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"library.json\""),
+            );
+            Ok(response)
         }
         Some(Err(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -104,16 +147,13 @@ pub async fn stream(
 }
 
 /// Cancel a running job.
+///
+/// Best-effort: if the job has already completed or never existed,
+/// returns 200 anyway.
 pub async fn cancel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if state.jobs.cancel(&id) {
-        Ok(Json(json!({ "cancelled": true })))
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "job not found" })),
-        ))
-    }
+) -> Json<Value> {
+    state.jobs.cancel(&id);
+    Json(json!({ "ok": true }))
 }

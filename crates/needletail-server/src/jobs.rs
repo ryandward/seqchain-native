@@ -1,25 +1,37 @@
 //! Background job management for pipeline execution.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
 
 use dashmap::DashMap;
 use uuid::Uuid;
 
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
-use needletail_core::models::region::Region;
-use needletail_core::pipeline::design::{self, LibraryResult, NullProgress, ProgressSink};
+use needletail_core::pipeline::design::{self, LibraryResult, ProgressSink};
 
 use crate::stores::genome_store::StoredGenome;
 
-/// Job status.
+/// Job status: queued → running → complete | failed | cancelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
-    Pending,
+    Queued,
     Running,
-    Completed,
+    Complete,
     Failed,
     Cancelled,
+}
+
+impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Queued => "queued",
+            JobStatus::Running => "running",
+            JobStatus::Complete => "complete",
+            JobStatus::Failed => "failed",
+            JobStatus::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// Shared progress state for a running job.
@@ -50,6 +62,34 @@ pub struct Job {
     pub progress: Arc<JobProgress>,
     pub result: std::sync::Mutex<Option<Result<LibraryResult, String>>>,
     pub error: std::sync::Mutex<Option<String>>,
+    pub guides_complete: AtomicUsize,
+    pub chroms_complete: AtomicUsize,
+    pub chroms_total: AtomicUsize,
+    /// Monotonic start time (nanos since some epoch, for elapsed calculation).
+    pub started_at: AtomicU64,
+    pub finished_at: AtomicU64,
+}
+
+impl Job {
+    /// Elapsed seconds since job started, or None if not started.
+    pub fn elapsed_secs(&self) -> Option<f64> {
+        let started = self.started_at.load(Ordering::Acquire);
+        if started == 0 {
+            return None;
+        }
+        let finished = self.finished_at.load(Ordering::Acquire);
+        let end = if finished > 0 { finished } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+        if end >= started {
+            Some((end - started) as f64 / 1000.0)
+        } else {
+            None
+        }
+    }
 }
 
 /// Thread-safe job manager.
@@ -71,27 +111,39 @@ impl JobManager {
         preset: CRISPRPreset,
         feature_config: FeatureConfig,
     ) -> String {
-        let job_id = Uuid::new_v4().to_string();
+        let job_id = Uuid::new_v4().simple().to_string()[..12].to_string();
         let progress = Arc::new(JobProgress {
-            stage: std::sync::Mutex::new("pending".into()),
+            stage: std::sync::Mutex::new("queued".into()),
             current: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
         });
 
+        let chroms_total = genome.genome.sequences.len();
+
         let job = Arc::new(Job {
             id: job_id.clone(),
             genome_id: genome.id.clone(),
-            status: std::sync::Mutex::new(JobStatus::Pending),
+            status: std::sync::Mutex::new(JobStatus::Queued),
             progress: progress.clone(),
             result: std::sync::Mutex::new(None),
             error: std::sync::Mutex::new(None),
+            guides_complete: AtomicUsize::new(0),
+            chroms_complete: AtomicUsize::new(0),
+            chroms_total: AtomicUsize::new(chroms_total),
+            started_at: AtomicU64::new(0),
+            finished_at: AtomicU64::new(0),
         });
 
         self.jobs.insert(job_id.clone(), job.clone());
 
         // Spawn blocking task
         tokio::task::spawn_blocking(move || {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            job.started_at.store(now_ms, Ordering::Release);
             *job.status.lock().unwrap() = JobStatus::Running;
 
             let result = design::design_library(
@@ -104,9 +156,19 @@ impl JobManager {
                 &*progress,
             );
 
+            let end_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            job.finished_at.store(end_ms, Ordering::Release);
+
             match &result {
-                Ok(_) => {
-                    *job.status.lock().unwrap() = JobStatus::Completed;
+                Ok(ref lib) => {
+                    job.guides_complete
+                        .store(lib.guides.len(), Ordering::Release);
+                    job.chroms_complete
+                        .store(job.chroms_total.load(Ordering::Acquire), Ordering::Release);
+                    *job.status.lock().unwrap() = JobStatus::Complete;
                 }
                 Err(e) => {
                     if e == "cancelled" {
@@ -129,10 +191,14 @@ impl JobManager {
         self.jobs.get(id).map(|v| v.clone())
     }
 
-    /// Cancel a job.
+    /// Cancel a job. Best-effort: always returns true if the job exists.
     pub fn cancel(&self, id: &str) -> bool {
         if let Some(job) = self.jobs.get(id) {
-            job.progress.cancelled.store(true, Ordering::Release);
+            let status = *job.status.lock().unwrap();
+            if status == JobStatus::Queued || status == JobStatus::Running {
+                job.progress.cancelled.store(true, Ordering::Release);
+                *job.status.lock().unwrap() = JobStatus::Cancelled;
+            }
             true
         } else {
             false

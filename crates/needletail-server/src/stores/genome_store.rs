@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use needletail_core::io::genbank::{load_fasta, load_genbank};
 use needletail_core::models::genome::Genome;
-use needletail_core::{FmIndexSearcher, IndexHandle, MappedIndex, SeedTier};
+use needletail_core::{FmIndexSearcher, IndexHandle, SeedTier};
 
 /// A stored genome with its FM-Index and seed tiers.
 pub struct StoredGenome {

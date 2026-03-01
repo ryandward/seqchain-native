@@ -35,13 +35,13 @@ async fn main() {
         .route("/api/genomes/upload", post(routes::genomes::upload))
         .route("/api/genomes/", get(routes::genomes::list))
         .route("/api/genomes/{id}", get(routes::genomes::get))
-        // Methods
-        .route("/api/methods", get(routes::methods::catalog))
+        // Methods — catalog + dynamic dispatch
+        .route("/api/methods", get(routes::methods::list_methods))
         .route(
-            "/api/methods/design_library",
-            post(routes::methods::design_library),
+            "/api/methods/{method_id}",
+            get(routes::methods::get_method).post(routes::methods::dispatch_method),
         )
-        // Jobs
+        // Jobs — status, stream, cancel
         .route("/api/jobs/{id}", get(routes::jobs::status))
         .route("/api/jobs/{id}/stream", get(routes::jobs::stream))
         .route("/api/jobs/{id}", delete(routes::jobs::cancel))
