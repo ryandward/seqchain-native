@@ -37,12 +37,23 @@ pub async fn status(
     let elapsed = job.elapsed_secs();
 
     let guides_complete = job.guides_complete.load(Ordering::Acquire);
-    let chroms_complete = job.chroms_complete.load(Ordering::Acquire);
-    let chroms_total = job.chroms_total.load(Ordering::Acquire);
 
-    // Compute progress metrics matching SeqChain's format
-    let pct: Option<f64> = if chroms_total > 0 && chroms_complete > 0 {
-        Some((chroms_complete as f64 / chroms_total as f64 * 1000.0).round() / 1000.0)
+    // Read step/stage/items from progress
+    let step = job.progress.step.lock().unwrap().clone();
+    let stage = job.progress.step_stage.lock().unwrap().clone();
+    let items_complete = job.progress.items_complete.load(Ordering::Acquire);
+    let items_total = job.progress.items_total.load(Ordering::Acquire);
+
+    // Items object: only present when items_total > 0
+    let items = if items_total > 0 {
+        json!({ "complete": items_complete, "total": items_total })
+    } else {
+        Value::Null
+    };
+
+    // pct_complete: per-step, derived from items when available
+    let pct: Option<f64> = if items_total > 0 {
+        Some((items_complete as f64 / items_total as f64 * 1000.0).round() / 1000.0)
     } else {
         None
     };
@@ -52,26 +63,14 @@ pub async fn status(
         _ => None,
     };
 
-    let mut eta: Option<i64> = if let Some(e) = elapsed {
-        if chroms_complete > 0 {
-            let secs_per_chrom = e / chroms_complete as f64;
-            Some((secs_per_chrom * (chroms_total - chroms_complete) as f64).round() as i64)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    if status == JobStatus::Complete {
-        eta = Some(0);
-    }
-
     let mut resp = json!({
         "status": status.as_str(),
+        "step": step,
+        "stage": stage,
+        "items": items,
         "progress": {
             "pct_complete": pct,
             "rate_per_sec": rate,
-            "eta_seconds": eta,
         },
         "error": Value::Null,
     });

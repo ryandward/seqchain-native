@@ -280,14 +280,31 @@ enum TableFormat {
     Sparse { n_entries: usize },
 }
 
-/// Memory-mapped k-mer seed table. Supports both dense and sparse formats.
+/// Backing storage: either mmap (file-loaded) or in-memory (SA sweep).
+enum TableData {
+    Mmap(Mmap),
+    Memory(Vec<u8>),
+}
+
+impl TableData {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            TableData::Mmap(m) => m,
+            TableData::Memory(v) => v,
+        }
+    }
+}
+
+/// K-mer seed table. Supports both dense and sparse formats,
+/// backed by either mmap (file-loaded) or in-memory data (SA sweep).
 pub struct KmerSeedTable {
-    mmap: Mmap,
+    data: TableData,
     k: usize,
     format: TableFormat,
 }
 
-// SAFETY: Mmap is Send+Sync (read-only view of a file). All other fields are trivially so.
+// SAFETY: Mmap is Send+Sync (read-only view of a file). Vec<u8> is trivially Send+Sync.
 unsafe impl Send for KmerSeedTable {}
 unsafe impl Sync for KmerSeedTable {}
 
@@ -297,17 +314,17 @@ impl KmerSeedTable {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        let format = Self::detect_format(&mmap, k)?;
-        Ok(KmerSeedTable { mmap, k, format })
+        let format = Self::detect_format(mmap.as_ref(), k)?;
+        Ok(KmerSeedTable { data: TableData::Mmap(mmap), k, format })
     }
 
-    /// Detect whether the file is dense or sparse.
-    fn detect_format(mmap: &Mmap, k: usize) -> std::io::Result<TableFormat> {
+    /// Detect whether byte data is dense or sparse format.
+    fn detect_format(bytes: &[u8], k: usize) -> std::io::Result<TableFormat> {
         // Check for sparse magic header
-        if mmap.len() >= SPARSE_HEADER_SIZE && mmap[0..4] == SPARSE_MAGIC {
-            let stored_k = u32::from_le_bytes([mmap[4], mmap[5], mmap[6], mmap[7]]) as usize;
+        if bytes.len() >= SPARSE_HEADER_SIZE && bytes[0..4] == SPARSE_MAGIC {
+            let stored_k = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
             let n_entries =
-                u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize;
+                u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
 
             if stored_k != k {
                 return Err(std::io::Error::new(
@@ -317,12 +334,12 @@ impl KmerSeedTable {
             }
 
             let expected = SPARSE_HEADER_SIZE + n_entries * SPARSE_ENTRY_SIZE;
-            if mmap.len() != expected {
+            if bytes.len() != expected {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "sparse index size mismatch: expected {} bytes for {} entries, got {}",
-                        expected, n_entries, mmap.len()
+                        expected, n_entries, bytes.len()
                     ),
                 ));
             }
@@ -331,12 +348,12 @@ impl KmerSeedTable {
         } else {
             // Dense format: validate size
             let expected = table_size(k) * 8;
-            if mmap.len() != expected {
+            if bytes.len() != expected {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "dense index size mismatch: expected {} bytes for k={}, got {}",
-                        expected, k, mmap.len()
+                        expected, k, bytes.len()
                     ),
                 ));
             }
@@ -390,7 +407,7 @@ impl KmerSeedTable {
     #[inline]
     fn lookup_rank_dense(&self, rank: usize) -> Option<(u32, u32)> {
         let offset = rank * 8;
-        let bytes = &self.mmap[offset..offset + 8];
+        let bytes = &self.data.as_bytes()[offset..offset + 8];
 
         let l = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let r = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -405,7 +422,7 @@ impl KmerSeedTable {
     #[inline]
     fn lookup_rank_sparse(&self, rank: usize, n_entries: usize) -> Option<(u32, u32)> {
         let rank = rank as u32;
-        let data = &self.mmap[SPARSE_HEADER_SIZE..];
+        let data = &self.data.as_bytes()[SPARSE_HEADER_SIZE..];
 
         // Binary search over sorted (rank, l, r) triples
         let mut lo = 0usize;
@@ -606,6 +623,167 @@ impl PosTable {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  SA Sweep: O(N) construction of both KmerSeedTable and PosTable
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build both KmerSeedTable and PosTable from a single O(N) sweep over the
+/// suffix array. Eliminates all backward searches and HashMap allocations.
+///
+/// Since the SA is lexicographically sorted, all occurrences of a k-mer form
+/// a contiguous run. One linear scan identifies every run boundary, yielding
+/// the exact BWT interval [l, r] (inclusive) for each k-mer — the same values
+/// that backward search would produce.
+///
+/// Genome positions are extracted directly from the SA slice within each run,
+/// sorted per k-mer to match the PosTable contract.
+pub fn sa_sweep_build(sa: &[usize], text: &[u8], k: usize) -> (KmerSeedTable, PosTable) {
+    let n = sa.len();
+
+    // Phase 1: Identify contiguous runs of identical k-mers in the sorted SA.
+    // Each run → (kmer_rank, sa_start_inclusive, sa_end_exclusive).
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    let mut cur_rank: Option<usize> = None;
+    let mut run_start: usize = 0;
+
+    for i in 0..n {
+        let pos = sa[i];
+        let this_rank = if pos + k <= text.len() {
+            kmer_to_rank(&text[pos..pos + k])
+        } else {
+            None
+        };
+
+        match (cur_rank, this_rank) {
+            (Some(cr), Some(tr)) if cr == tr => {} // same k-mer, extend run
+            (Some(cr), _) => {
+                // run ended
+                runs.push((cr, run_start, i));
+                if let Some(tr) = this_rank {
+                    cur_rank = Some(tr);
+                    run_start = i;
+                } else {
+                    cur_rank = None;
+                }
+            }
+            (None, Some(tr)) => {
+                cur_rank = Some(tr);
+                run_start = i;
+            }
+            (None, None) => {}
+        }
+    }
+    if let Some(cr) = cur_rank {
+        runs.push((cr, run_start, n));
+    }
+
+    // Phase 2: Build both tables from runs.
+    let is_dense = k <= SPARSE_THRESHOLD;
+
+    // ── KmerSeedTable ──────────────────────────────────────────────────────
+    let kmer_table = if is_dense {
+        let n_entries = table_size(k);
+        let mut bytes = vec![0u8; n_entries * 8];
+        // Initialize all to ABSENT
+        for rank_idx in 0..n_entries {
+            let off = rank_idx * 8;
+            bytes[off..off + 4].copy_from_slice(&ABSENT_L.to_le_bytes());
+            bytes[off + 4..off + 8].copy_from_slice(&ABSENT_R.to_le_bytes());
+        }
+        // Fill from runs: (l, r) are SA indices, inclusive
+        for &(rank, sa_start, sa_end) in &runs {
+            let off = rank * 8;
+            bytes[off..off + 4].copy_from_slice(&(sa_start as u32).to_le_bytes());
+            bytes[off + 4..off + 8].copy_from_slice(&((sa_end - 1) as u32).to_le_bytes());
+        }
+        KmerSeedTable {
+            data: TableData::Memory(bytes),
+            k,
+            format: TableFormat::Dense,
+        }
+    } else {
+        // Sparse: NTKS header + sorted (rank, l, r) triples
+        let mut bytes = Vec::with_capacity(SPARSE_HEADER_SIZE + runs.len() * SPARSE_ENTRY_SIZE);
+        bytes.extend_from_slice(&SPARSE_MAGIC);
+        bytes.extend_from_slice(&(k as u32).to_le_bytes());
+        bytes.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // padding
+        // Runs are already sorted by rank (SA is sorted → k-mers appear in lex order)
+        for &(rank, sa_start, sa_end) in &runs {
+            bytes.extend_from_slice(&(rank as u32).to_le_bytes());
+            bytes.extend_from_slice(&(sa_start as u32).to_le_bytes());
+            bytes.extend_from_slice(&((sa_end - 1) as u32).to_le_bytes());
+        }
+        KmerSeedTable {
+            data: TableData::Memory(bytes),
+            k,
+            format: TableFormat::Sparse { n_entries: runs.len() },
+        }
+    };
+
+    // ── PosTable ───────────────────────────────────────────────────────────
+    let total_positions: usize = runs.iter().map(|&(_, s, e)| e - s).sum();
+
+    let pos_table = if is_dense {
+        let n_entries = table_size(k);
+        // Build offsets: prefix sum of run lengths, slotted by rank
+        let mut offsets = vec![0u32; n_entries + 1];
+        for &(rank, sa_start, sa_end) in &runs {
+            offsets[rank] = (sa_end - sa_start) as u32;
+        }
+        // Convert counts to prefix sums
+        let mut acc = 0u32;
+        for i in 0..n_entries {
+            let count = offsets[i];
+            offsets[i] = acc;
+            acc += count;
+        }
+        offsets[n_entries] = acc;
+
+        // Fill positions from SA, sorted per k-mer
+        let mut positions = vec![0u32; total_positions];
+        for &(rank, sa_start, sa_end) in &runs {
+            let dst_start = offsets[rank] as usize;
+            let run_len = sa_end - sa_start;
+            for j in 0..run_len {
+                positions[dst_start + j] = sa[sa_start + j] as u32;
+            }
+            // Sort this k-mer's positions (genome order)
+            positions[dst_start..dst_start + run_len].sort_unstable();
+        }
+
+        PosTable {
+            inner: PosTableInner::Dense { offsets, positions },
+            k,
+        }
+    } else {
+        // Sparse: (rank, offset_start, offset_end) index + flat positions
+        let mut index = Vec::with_capacity(runs.len());
+        let mut positions = Vec::with_capacity(total_positions);
+
+        for &(rank, sa_start, sa_end) in &runs {
+            let dst_start = positions.len() as u32;
+            let run_len = sa_end - sa_start;
+            // Copy genome positions from SA
+            let pos_start = positions.len();
+            for j in 0..run_len {
+                positions.push(sa[sa_start + j] as u32);
+            }
+            // Sort genome positions for this k-mer
+            positions[pos_start..].sort_unstable();
+            let dst_end = positions.len() as u32;
+            index.push((rank as u32, dst_start, dst_end));
+        }
+
+        PosTable {
+            inner: PosTableInner::Sparse { index, positions },
+            k,
+        }
+    };
+
+    (kmer_table, pos_table)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Utility
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -675,5 +853,97 @@ mod tests {
             let s = sparse.positions_for_rank(rank);
             assert_eq!(d, s, "mismatch at rank {}", rank);
         }
+    }
+
+    #[test]
+    fn test_sa_sweep_vs_old_dense() {
+        // Build a small genome with sentinel
+        let text = b"ACGTACGTCCGGTTAA$";
+        let k = 4;
+
+        // Build suffix array
+        let sa = bio::data_structures::suffix_array::suffix_array(text);
+
+        // SA sweep
+        let (sweep_kmer, sweep_pos) = sa_sweep_build(&sa, text, k);
+
+        // Old builder: PosTable
+        let old_pos = PosTable::build_dense(text, k);
+
+        // Compare PosTable: all ranks should match
+        let n_entries = table_size(k);
+        for rank in 0..n_entries {
+            let sweep_p = sweep_pos.positions_for_rank(rank);
+            let old_p = old_pos.positions_for_rank(rank);
+            assert_eq!(
+                sweep_p, old_p,
+                "PosTable mismatch at rank {} (k-mer {:?})",
+                rank,
+                rank_to_kmer(rank, k)
+            );
+        }
+
+        // Verify KmerSeedTable: SA intervals should be consistent with positions
+        for rank in 0..n_entries {
+            let positions = sweep_pos.positions_for_rank(rank);
+            match sweep_kmer.lookup_rank(rank) {
+                Some((l, r)) => {
+                    let interval_size = (r - l + 1) as usize;
+                    assert_eq!(
+                        interval_size,
+                        positions.len(),
+                        "KmerSeedTable interval size mismatch at rank {}",
+                        rank
+                    );
+                }
+                None => {
+                    assert!(
+                        positions.is_empty(),
+                        "KmerSeedTable says absent but PosTable has {} positions at rank {}",
+                        positions.len(),
+                        rank
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sa_sweep_vs_old_sparse() {
+        // Build a genome large enough for sparse (K=14 uses sparse format)
+        // Use a repeated pattern to get enough length
+        let mut text = Vec::new();
+        for _ in 0..100 {
+            text.extend_from_slice(b"ACGTACGTCCGGTTAANNACGTGCTAGCTAGC");
+        }
+        text.push(b'$');
+        let k = 14;
+
+        let sa = bio::data_structures::suffix_array::suffix_array(&text);
+
+        let (sweep_kmer, sweep_pos) = sa_sweep_build(&sa, &text, k);
+        let old_pos = PosTable::build_sparse(&text, k);
+
+        // Collect all non-empty ranks from old builder
+        for rank in 0..table_size(k).min(268_435_456) {
+            let old_p = old_pos.positions_for_rank(rank);
+            let sweep_p = sweep_pos.positions_for_rank(rank);
+
+            if !old_p.is_empty() || !sweep_p.is_empty() {
+                // Sort both for comparison (old sparse doesn't guarantee order)
+                let mut old_sorted = old_p.to_vec();
+                let mut sweep_sorted = sweep_p.to_vec();
+                old_sorted.sort_unstable();
+                sweep_sorted.sort_unstable();
+                assert_eq!(
+                    old_sorted, sweep_sorted,
+                    "PosTable mismatch at rank {} (k={})",
+                    rank, k
+                );
+            }
+        }
+
+        // Verify KmerSeedTable consistency
+        assert!(sweep_kmer.is_sparse());
     }
 }

@@ -82,6 +82,12 @@ fn method_catalog() -> Vec<Value> {
             "type": "file",
             "description": "Scored guide library",
         },
+        "steps": [
+            { "key": "indexing",   "label": "Building FM-Index" },
+            { "key": "scanning",   "label": "Scanning genome" },
+            { "key": "scoring",    "label": "Scoring & annotation" },
+            { "key": "filtering",  "label": "Filtering library" },
+        ],
     })]
 }
 

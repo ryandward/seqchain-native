@@ -31,8 +31,28 @@ use crate::{
 };
 
 /// Progress callback for reporting pipeline stage advancement.
+///
+/// The step/stage/items model:
+/// - **step**: UI step key (matches method schema `steps[].key`)
+/// - **stage**: free-text sublabel within the current step
+/// - **items**: discrete n-of-x counter for countable work
+///
+/// `pct_complete` is per-step: it resets when step changes.
 pub trait ProgressSink: Send + Sync {
     fn report(&self, stage: &str, current: usize, total: usize);
+
+    /// Set the current UI step key (e.g., "scanning", "scoring").
+    fn set_step(&self, _step: &str) {}
+
+    /// Set a free-text sublabel within the current step.
+    fn set_stage(&self, _stage: &str) {}
+
+    /// Report item-level progress within a step.
+    fn set_items(&self, _complete: usize, _total: usize) {}
+
+    /// Clear item counter (when entering a step with no countable items).
+    fn clear_items(&self) {}
+
     fn is_cancelled(&self) -> bool { false }
 }
 
@@ -70,8 +90,11 @@ pub fn design_library(
     feature_config: &FeatureConfig,
     progress: &dyn ProgressSink,
 ) -> Result<LibraryResult, String> {
-    // ── Stage 1: Feature tiling ─────────────────────────────────────────────
-    progress.report("tiling", 0, 7);
+    // ── Step: indexing (brief — index was built at upload time) ─────────────
+    progress.set_step("indexing");
+    progress.set_stage("Preparing genome data");
+    progress.clear_items();
+    progress.report("indexing", 0, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -79,10 +102,16 @@ pub fn design_library(
     let genes: Vec<Region> = genome.genes().into_iter().cloned().collect();
     let chrom_sizes = genome.chrom_length_map();
 
+    // ── Step: scanning ──────────────────────────────────────────────────────
+    progress.set_step("scanning");
+    progress.set_stage("Tiling genome features");
+    progress.clear_items();
+    progress.report("tiling", 1, 7);
+
     let feature_tiles = annotate_features(&genes, feature_config, &chrom_sizes);
 
-    // ── Stage 2: PAM scanning ───────────────────────────────────────────────
-    progress.report("scanning", 1, 7);
+    progress.set_stage("Scanning PAM sites");
+    progress.report("scanning", 2, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -106,8 +135,8 @@ pub fn design_library(
         topo_ref,
     )?;
 
-    // ── Stage 3: Guide enrichment ───────────────────────────────────────────
-    progress.report("enriching", 2, 7);
+    progress.set_stage("Enriching guide hits");
+    progress.report("enriching", 3, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -115,8 +144,11 @@ pub fn design_library(
     let chrom_ranges = chroms.ranges.clone();
     let guide_hits = enrich_hits(pam_hits, &chrom_names, direction, topo_ref, &chrom_ranges);
 
-    // ── Stage 4: Off-target scoring ─────────────────────────────────────────
-    progress.report("scoring", 3, 7);
+    // ── Step: scoring ───────────────────────────────────────────────────────
+    progress.set_step("scoring");
+    progress.set_stage("Scoring off-targets");
+    progress.clear_items();
+    progress.report("scoring", 4, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -147,6 +179,7 @@ pub fn design_library(
     }
 
     // Search all unique spacers
+    progress.set_items(0, unique_spacers.len());
     let hit_counts = if !unique_spacers.is_empty() {
         score_spacers(
             &unique_spacers,
@@ -162,8 +195,10 @@ pub fn design_library(
         vec![]
     };
 
-    // ── Stage 5: Build scored guide Regions ──────────────────────────────────
-    progress.report("annotating", 4, 7);
+    // ── Build scored guide Regions ────────────────────────────────────────────
+    progress.set_stage("Building scored regions");
+    progress.set_items(0, n_guides);
+    progress.report("annotating", 5, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -219,8 +254,10 @@ pub fn design_library(
     // Sort guides by (chrom, start) for sweep-line
     scored_guides.sort_by(|a, b| a.chrom.cmp(&b.chrom).then(a.start.cmp(&b.start)));
 
-    // ── Stage 6: Sweep-line annotation ──────────────────────────────────────
-    progress.report("sweep", 5, 7);
+    // ── Sweep-line annotation ────────────────────────────────────────────────
+    progress.set_stage("Annotating against features");
+    progress.clear_items();
+    progress.report("sweep", 6, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -230,8 +267,11 @@ pub fn design_library(
         chrom_len_map.get(chrom).map(|&len| len as i64)
     });
 
-    // ── Stage 7: Filter promoters + TSS distance ────────────────────────────
-    progress.report("filtering", 6, 7);
+    // ── Step: filtering ─────────────────────────────────────────────────────
+    progress.set_step("filtering");
+    progress.set_stage("Filtering promoter guides");
+    progress.set_items(0, annotated.len());
+    progress.report("filtering", 7, 8);
 
     let promoter_guides: Vec<Region> = annotated
         .into_iter()
@@ -259,7 +299,9 @@ pub fn design_library(
         })
         .collect();
 
-    progress.report("done", 7, 7);
+    progress.set_items(promoter_guides.len(), promoter_guides.len());
+    progress.set_stage("Complete");
+    progress.report("done", 8, 8);
 
     Ok(LibraryResult {
         guides: promoter_guides,

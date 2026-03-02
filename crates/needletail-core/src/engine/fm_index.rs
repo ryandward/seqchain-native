@@ -350,6 +350,9 @@ pub struct FmIndexSearcher {
 impl FmIndexSearcher {
     /// Build an FM-Index from a FASTA file.
     pub fn from_fasta(path: &str) -> Result<Self, SearchError> {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
         let reader =
             fasta::Reader::from_file(path).map_err(SearchError::Other)?;
 
@@ -381,12 +384,29 @@ impl FmIndexSearcher {
             )));
         }
 
+        let t_fasta = t0.elapsed();
+        eprintln!("[fm_index] FASTA parse: {:.3}s ({} bp, {} chroms)",
+            t_fasta.as_secs_f64(), text.len(), chroms.len());
+
+        let t1 = Instant::now();
         let alphabet = Alphabet::new(b"$ACGTN");
         let sa = suffix_array(&text);
+        let t_sa = t1.elapsed();
+        eprintln!("[fm_index] suffix_array (SA-IS): {:.3}s", t_sa.as_secs_f64());
+
+        let t2 = Instant::now();
         let bwt_seq = bwt(&text, &sa);
         let less_tbl = less(&bwt_seq, &alphabet);
+        let t_bwt = t2.elapsed();
+        eprintln!("[fm_index] BWT + less: {:.3}s", t_bwt.as_secs_f64());
 
+        let t3 = Instant::now();
         let rank = BlockRank::from_bwt_and_less(&bwt_seq, &less_tbl);
+        let t_rank = t3.elapsed();
+        eprintln!("[fm_index] BlockRank: {:.3}s ({} blocks)",
+            t_rank.as_secs_f64(), rank.blocks.len());
+
+        eprintln!("[fm_index] total: {:.3}s", t0.elapsed().as_secs_f64());
 
         Ok(FmIndexSearcher {
             rank,
@@ -475,5 +495,10 @@ impl FmOcc for FmIndexSearcher {
     #[inline]
     fn rank_blocks(&self) -> Option<(&[RankBlock], &[usize; 256])> {
         Some((self.rank.blocks(), self.rank.less_table()))
+    }
+
+    #[inline]
+    fn sa_slice(&self) -> Option<&[usize]> {
+        Some(&self.sa)
     }
 }

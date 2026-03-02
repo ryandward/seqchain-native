@@ -101,12 +101,12 @@ pub fn filter_hits_by_pam(
         if validate_pam_at(
             text, chroms, sa_pos, spacer_len, fwd, compiled, direction, topologies,
         ) {
-            if kept != i {
-                acc.query_id[kept] = acc.query_id[i];
-                acc.position[kept] = acc.position[i];
-                acc.strand[kept] = acc.strand[i];
-                acc.score[kept] = acc.score[i];
-            }
+            // Unconditional writes — redundant self-copy is cheaper than
+            // an unpredictable branch on `kept != i`.
+            acc.query_id[kept] = acc.query_id[i];
+            acc.position[kept] = acc.position[i];
+            acc.strand[kept] = acc.strand[i];
+            acc.score[kept] = acc.score[i];
             kept += 1;
         }
     }

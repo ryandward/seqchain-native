@@ -39,6 +39,9 @@ impl GenomeStore {
         fasta_path: Option<&str>,
         index_path: Option<&str>,
     ) -> Result<String, String> {
+        use std::time::Instant;
+        let t0 = Instant::now();
+
         let path = Path::new(file_path);
         let ext = path
             .extension()
@@ -51,6 +54,8 @@ impl GenomeStore {
         } else {
             load_fasta(path, None)?
         };
+        let t_parse = t0.elapsed();
+        eprintln!("[upload] genome parse: {:.3}s", t_parse.as_secs_f64());
 
         // Build or load FM-Index
         let (index, tier_small, tier_large) = if let Some(idx_path) = index_path {
@@ -66,18 +71,23 @@ impl GenomeStore {
 
             (handle, ts, tl)
         } else if let Some(fa_path) = fasta_path {
+            let t_idx = Instant::now();
             let searcher = FmIndexSearcher::from_fasta(fa_path)
                 .map_err(|e| e.to_string())?;
             let searcher = Arc::new(searcher);
+            eprintln!("[upload] FM-Index build: {:.3}s", t_idx.elapsed().as_secs_f64());
 
+            let t_seed = Instant::now();
             let (ts, tl) = needletail_core::build_seed_tiers(&*searcher, searcher.text(), fa_path)
                 .map_err(|e| e.to_string())?;
+            eprintln!("[upload] seed tiers: {:.3}s", t_seed.elapsed().as_secs_f64());
 
             (IndexHandle::Built(searcher), Some(ts), Some(tl))
         } else {
             return Err("Either fasta_path or index_path must be provided".into());
         };
 
+        eprintln!("[upload] total: {:.3}s", t0.elapsed().as_secs_f64());
         let id = Uuid::new_v4().to_string();
         let stored = Arc::new(StoredGenome {
             id: id.clone(),

@@ -131,6 +131,11 @@ pub trait FmOcc {
     /// Returns `(blocks, less_table)` where each `RankBlock` is 64 bytes covering
     /// 64 BWT positions. Preferred over `rank_data()` — 16× smaller, fits in L3.
     fn rank_blocks(&self) -> Option<(&[RankBlock], &[usize; 256])> { None }
+
+    /// Raw suffix array as a contiguous slice, if available.
+    /// Enables O(N) SA sweep for seed table construction.
+    /// Default: None (use `sa(idx)` for individual lookups).
+    fn sa_slice(&self) -> Option<&[usize]> { None }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -35,11 +35,24 @@ impl JobStatus {
 }
 
 /// Shared progress state for a running job.
+///
+/// Supports the step/stage/items model for GenomeHub's stepper UI:
+/// - `step`: current UI step key (matches method schema `steps[].key`)
+/// - `step_stage`: free-text sublabel within the current step
+/// - `items_complete`/`items_total`: discrete n-of-x counter
 pub struct JobProgress {
     pub stage: std::sync::Mutex<String>,
     pub current: AtomicUsize,
     pub total: AtomicUsize,
     pub cancelled: AtomicBool,
+    /// Current UI step key (e.g., "scanning", "scoring").
+    pub step: std::sync::Mutex<Option<String>>,
+    /// Free-text sublabel within the current step.
+    pub step_stage: std::sync::Mutex<Option<String>>,
+    /// Item-level progress: complete count.
+    pub items_complete: AtomicUsize,
+    /// Item-level progress: total count. 0 = no items.
+    pub items_total: AtomicUsize,
 }
 
 impl ProgressSink for JobProgress {
@@ -47,6 +60,28 @@ impl ProgressSink for JobProgress {
         *self.stage.lock().unwrap() = stage.to_string();
         self.current.store(current, Ordering::Release);
         self.total.store(total, Ordering::Release);
+    }
+
+    fn set_step(&self, step: &str) {
+        *self.step.lock().unwrap() = Some(step.to_string());
+        // Reset stage and items on step change
+        *self.step_stage.lock().unwrap() = None;
+        self.items_complete.store(0, Ordering::Release);
+        self.items_total.store(0, Ordering::Release);
+    }
+
+    fn set_stage(&self, stage: &str) {
+        *self.step_stage.lock().unwrap() = Some(stage.to_string());
+    }
+
+    fn set_items(&self, complete: usize, total: usize) {
+        self.items_complete.store(complete, Ordering::Release);
+        self.items_total.store(total, Ordering::Release);
+    }
+
+    fn clear_items(&self) {
+        self.items_complete.store(0, Ordering::Release);
+        self.items_total.store(0, Ordering::Release);
     }
 
     fn is_cancelled(&self) -> bool {
@@ -117,6 +152,10 @@ impl JobManager {
             current: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
+            step: std::sync::Mutex::new(None),
+            step_stage: std::sync::Mutex::new(None),
+            items_complete: AtomicUsize::new(0),
+            items_total: AtomicUsize::new(0),
         });
 
         let chroms_total = genome.genome.sequences.len();

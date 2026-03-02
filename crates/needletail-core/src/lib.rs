@@ -27,7 +27,7 @@ pub mod pipeline;
 // ─── Re-exports for convenience ──────────────────────────────────────────────
 pub use chemistry::{CompiledPam, PamDirection};
 pub use engine::fm_index::FmIndexSearcher;
-pub use engine::kmer_index::{KmerSeedTable, PosTable, SEED_K_LARGE, SEED_K_SMALL};
+pub use engine::kmer_index::{sa_sweep_build, KmerSeedTable, PosTable, SEED_K_LARGE, SEED_K_SMALL};
 pub use engine::simd_search::{
     search_width_first, search_width_first_seeded, ChromGeometry, FmOcc, HitAccumulator,
 };
@@ -218,23 +218,65 @@ pub fn prepare_queries(
 // ─── Seed tier construction ─────────────────────────────────────────────────
 
 /// Build both seed tiers (K=10 and K=14) from an FM-Index.
+///
+/// When the suffix array is available as a contiguous slice (i.e. built from
+/// FASTA, not loaded from mmap), uses a single O(N) SA sweep per K value.
+/// This eliminates all backward searches and HashMap allocations.
 pub fn build_seed_tiers<I: FmOcc>(
     index: &I,
     text: &[u8],
     fasta_path: &str,
 ) -> Result<(SeedTier, SeedTier), String> {
-    let seed_small = KmerSeedTable::open_or_build_from_text(index, text, fasta_path, SEED_K_SMALL)
-        .map_err(|e| format!("Failed to build/load K={} seed table: {}", SEED_K_SMALL, e))?;
-    let pos_small = PosTable::build(text, SEED_K_SMALL);
+    use engine::kmer_index::sa_sweep_build;
+    use std::time::Instant;
 
-    let seed_large = KmerSeedTable::open_or_build_from_text(index, text, fasta_path, SEED_K_LARGE)
-        .map_err(|e| format!("Failed to build/load K={} seed table: {}", SEED_K_LARGE, e))?;
-    let pos_large = PosTable::build(text, SEED_K_LARGE);
+    if let Some(sa) = index.sa_slice() {
+        // ── SA Sweep path: O(N) per K, no backward searches, no HashMap ──
+        let t0 = Instant::now();
+        let (seed_small, pos_small) = sa_sweep_build(sa, text, SEED_K_SMALL);
+        eprintln!(
+            "[seed] K={} SA sweep (KmerSeedTable + PosTable): {:.3}s",
+            SEED_K_SMALL,
+            t0.elapsed().as_secs_f64()
+        );
 
-    Ok((
-        SeedTier { seed_table: Arc::new(seed_small), pos_table: Arc::new(pos_small) },
-        SeedTier { seed_table: Arc::new(seed_large), pos_table: Arc::new(pos_large) },
-    ))
+        let t1 = Instant::now();
+        let (seed_large, pos_large) = sa_sweep_build(sa, text, SEED_K_LARGE);
+        eprintln!(
+            "[seed] K={} SA sweep (KmerSeedTable + PosTable): {:.3}s",
+            SEED_K_LARGE,
+            t1.elapsed().as_secs_f64()
+        );
+
+        Ok((
+            SeedTier { seed_table: Arc::new(seed_small), pos_table: Arc::new(pos_small) },
+            SeedTier { seed_table: Arc::new(seed_large), pos_table: Arc::new(pos_large) },
+        ))
+    } else {
+        // ── Fallback: backward search + text scan (mmap-loaded indexes) ──
+        let t0 = Instant::now();
+        let seed_small = KmerSeedTable::open_or_build_from_text(index, text, fasta_path, SEED_K_SMALL)
+            .map_err(|e| format!("Failed to build/load K={} seed table: {}", SEED_K_SMALL, e))?;
+        eprintln!("[seed] K={} KmerSeedTable: {:.3}s", SEED_K_SMALL, t0.elapsed().as_secs_f64());
+
+        let t1 = Instant::now();
+        let pos_small = PosTable::build(text, SEED_K_SMALL);
+        eprintln!("[seed] K={} PosTable: {:.3}s", SEED_K_SMALL, t1.elapsed().as_secs_f64());
+
+        let t2 = Instant::now();
+        let seed_large = KmerSeedTable::open_or_build_from_text(index, text, fasta_path, SEED_K_LARGE)
+            .map_err(|e| format!("Failed to build/load K={} seed table: {}", SEED_K_LARGE, e))?;
+        eprintln!("[seed] K={} KmerSeedTable: {:.3}s", SEED_K_LARGE, t2.elapsed().as_secs_f64());
+
+        let t3 = Instant::now();
+        let pos_large = PosTable::build(text, SEED_K_LARGE);
+        eprintln!("[seed] K={} PosTable: {:.3}s", SEED_K_LARGE, t3.elapsed().as_secs_f64());
+
+        Ok((
+            SeedTier { seed_table: Arc::new(seed_small), pos_table: Arc::new(pos_small) },
+            SeedTier { seed_table: Arc::new(seed_large), pos_table: Arc::new(pos_large) },
+        ))
+    }
 }
 
 /// Select the appropriate seed tier based on mismatch level and query length.
@@ -270,37 +312,52 @@ pub fn select_tier<'a>(
 }
 
 /// Build a single seed tier (K=10 or K=14) from an index handle.
+///
+/// Uses SA sweep for `Built` handles (suffix array available in memory).
+/// Falls back to backward search + text scan for `Loaded` handles.
 pub fn build_seed_tier_for_handle(
     handle: &IndexHandle,
     text: &[u8],
     index_path: &str,
     k: usize,
 ) -> Option<SeedTier> {
-    let idx_path = Path::new(index_path);
-    let stem = idx_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let parent = idx_path.parent().unwrap_or_else(|| Path::new("."));
-    let kmer_path = parent.join(format!("{}.{}mer.idx", stem, k));
-
-    let table = match handle {
+    match handle {
         IndexHandle::Built(s) => {
-            KmerSeedTable::open_or_build_from_text(&**s, text, "<mmap>", k).ok()
-        }
-        IndexHandle::Loaded(_m) => {
-            if kmer_path.exists() {
-                KmerSeedTable::open(&kmer_path, k).ok()
-            } else {
-                engine::kmer_index::build_kmer_index_from_text(&**_m, text, k, &kmer_path)
-                    .ok()
-                    .and_then(|()| KmerSeedTable::open(&kmer_path, k).ok())
+            // SA sweep: O(N) construction from suffix array
+            if let Some(sa) = s.sa_slice() {
+                let (seed_table, pos_table) = engine::kmer_index::sa_sweep_build(sa, text, k);
+                return Some(SeedTier {
+                    seed_table: Arc::new(seed_table),
+                    pos_table: Arc::new(pos_table),
+                });
             }
+            // Fallback (shouldn't happen for FmIndexSearcher)
+            let table = KmerSeedTable::open_or_build_from_text(&**s, text, "<mmap>", k).ok()?;
+            Some(SeedTier {
+                seed_table: Arc::new(table),
+                pos_table: Arc::new(PosTable::build(text, k)),
+            })
         }
-    };
+        IndexHandle::Loaded(m) => {
+            let idx_path = Path::new(index_path);
+            let stem = idx_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let parent = idx_path.parent().unwrap_or_else(|| Path::new("."));
+            let kmer_path = parent.join(format!("{}.{}mer.idx", stem, k));
 
-    table.map(|t| SeedTier {
-        seed_table: Arc::new(t),
-        pos_table: Arc::new(PosTable::build(text, k)),
-    })
+            let table = if kmer_path.exists() {
+                KmerSeedTable::open(&kmer_path, k).ok()?
+            } else {
+                engine::kmer_index::build_kmer_index_from_text(&**m, text, k, &kmer_path)
+                    .ok()?;
+                KmerSeedTable::open(&kmer_path, k).ok()?
+            };
+            Some(SeedTier {
+                seed_table: Arc::new(table),
+                pos_table: Arc::new(PosTable::build(text, k)),
+            })
+        }
+    }
 }

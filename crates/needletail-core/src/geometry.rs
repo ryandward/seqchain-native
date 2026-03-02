@@ -43,15 +43,17 @@ pub fn interval_envelope(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> 
     (a_start.min(b_start), a_end.max(b_end))
 }
 
-/// Collapse a 2×2 orientation matrix into one boolean.
+/// Parity of strand and direction vectors in an oriented 1D space.
 ///
-/// Given two orientation flags — `is_forward` (strand) and
-/// `is_downstream` (direction) — returns `true` when the secondary
-/// region sits at lower coordinates than the primary region.
+/// Let σ ∈ {+1,−1} be the strand vector (forward = +1, reverse = −1)
+/// and δ ∈ {+1,−1} be the direction vector (downstream = +1, upstream = −1).
+///
+/// Returns `true` when the spacer sits at lower coordinates than the PAM.
+/// This is XNOR (equivalence) on the boolean encoding: σ·δ > 0.
 ///
 /// Truth table:
 /// ```text
-///   fwd + downstream → true   (secondary below primary)
+///   fwd + downstream → true   (spacer below PAM)
 ///   fwd + upstream   → false
 ///   rev + downstream → false
 ///   rev + upstream   → true
@@ -65,22 +67,20 @@ pub fn is_low_side(is_forward: bool, is_downstream: bool) -> bool {
 //  Byte-level sequence operations
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Complement a single DNA base byte. Pure byte transform.
-///
-/// A↔T, C↔G (both cases). Non-ACGT → N.
+/// Static complement table: one L1 cache hit per base, zero branches.
+static COMPLEMENT: [u8; 256] = {
+    let mut t = [b'N'; 256];
+    t[b'A' as usize] = b'T'; t[b'T' as usize] = b'A';
+    t[b'C' as usize] = b'G'; t[b'G' as usize] = b'C';
+    t[b'a' as usize] = b't'; t[b't' as usize] = b'a';
+    t[b'c' as usize] = b'g'; t[b'g' as usize] = b'c';
+    t
+};
+
+/// Complement a single DNA base byte. A↔T, C↔G (both cases). Non-ACGT → N.
 #[inline(always)]
 pub fn complement_base(b: u8) -> u8 {
-    match b {
-        b'A' => b'T',
-        b'T' => b'A',
-        b'C' => b'G',
-        b'G' => b'C',
-        b'a' => b't',
-        b't' => b'a',
-        b'c' => b'g',
-        b'g' => b'c',
-        _ => b'N',
-    }
+    COMPLEMENT[b as usize]
 }
 
 /// Fetch `length` bases from `text[chrom_start..]` at local offset `start`.
@@ -146,40 +146,7 @@ pub fn interval_overlap(
             overlap.max(0)
         }
         Some(cl) => {
-            // Circular mode: normalize and check overlap
-            let a_s_n = a_s.rem_euclid(cl);
-            let a_e_n = a_e.rem_euclid(cl);
-            let b_s_n = b_s.rem_euclid(cl);
-            let b_e_n = b_e.rem_euclid(cl);
-
-            // Effective lengths
-            let a_len = if a_e_n > a_s_n {
-                a_e_n - a_s_n
-            } else {
-                cl - a_s_n + a_e_n
-            };
-            let b_len = if b_e_n > b_s_n {
-                b_e_n - b_s_n
-            } else {
-                cl - b_s_n + b_e_n
-            };
-
-            // Compute gap between intervals on the circle
-            let gap1 = (b_s_n - a_e_n).rem_euclid(cl);
-            let gap2 = (a_s_n - b_e_n).rem_euclid(cl);
-            let gap = gap1.min(gap2);
-
-            // Total span = a_len + b_len + gap(s). If a_len + b_len > gap,
-            // they overlap by the difference.
-            let total = a_len + b_len;
-            if total + gap <= cl {
-                // They overlap by total - (cl - gap) ... actually simpler:
-                // overlap = a_len + b_len - (distance traversed to cover both)
-                let union = cl - gap.min(cl - a_len).min(cl - b_len);
-                let _ = union; // Unused in this branch
-            }
-
-            // Simpler approach: unwrap both intervals to linear and compute
+            // Circular mode: unwrap intervals to linear and try direct + wrapped
             let a_len_actual = a_e - a_s;
             let b_len_actual = b_e - b_s;
             if a_len_actual <= 0 || b_len_actual <= 0 {
@@ -198,11 +165,19 @@ pub fn interval_overlap(
     }
 }
 
-/// Strand-aware offset of a target interval within a feature.
+/// Strand-aware offset of a target within a feature via affine endpoint selection.
 ///
-/// Forward strand: `target_start - feature_start`
-/// Reverse strand: `feature_end - target_end`
-/// Handles circular chromosomes via modular arithmetic.
+/// The offset is the signed distance from the feature's 5′ end to the
+/// target's 5′ end, projected onto the strand basis vector σ.
+///
+/// Let pick_a = fwd as i64 (1 for forward, 0 for reverse).
+/// Forward selects (start, start), reverse selects (end, end):
+///   t_ep = t_s · pick_a + t_e_eff · (1 − pick_a)
+///   f_ep = f_s · pick_a + f_e_eff · (1 − pick_a)
+///   σ = 2 · pick_a − 1
+///   offset = (t_ep − f_ep) · σ
+///
+/// Zero branches on strand. Branch only on topology mode (circular vs linear).
 ///
 /// Port of: `seqchain.primitives.coordinates.offset_in_feature`
 #[inline(always)]
@@ -214,22 +189,25 @@ pub fn offset_in_feature(
     fwd: bool,
     chrom_len: i64,
 ) -> i64 {
+    let pick_a = fwd as i64;
+    let sigma = pick_a * 2 - 1;
+
     if chrom_len > 0 {
         let ts = t_s.rem_euclid(chrom_len);
         let te = t_e.rem_euclid(chrom_len);
         let fs = f_s.rem_euclid(chrom_len);
         let fe = f_e.rem_euclid(chrom_len);
-        if fwd {
-            (ts - fs).rem_euclid(chrom_len)
-        } else {
-            let te_eff = if te == 0 { chrom_len } else { te };
-            let fe_eff = if fe == 0 { chrom_len } else { fe };
-            (fe_eff - te_eff).rem_euclid(chrom_len)
-        }
-    } else if fwd {
-        t_s - f_s
+        // Zero-guard: rem_euclid can yield 0 for end positions on the boundary;
+        // branchless replacement with chrom_len preserves circular arithmetic.
+        let te_eff = te + (te == 0) as i64 * chrom_len;
+        let fe_eff = fe + (fe == 0) as i64 * chrom_len;
+        let t_ep = ts * pick_a + te_eff * (1 - pick_a);
+        let f_ep = fs * pick_a + fe_eff * (1 - pick_a);
+        ((t_ep - f_ep) * sigma).rem_euclid(chrom_len)
     } else {
-        f_e - t_e
+        let t_ep = t_s * pick_a + t_e * (1 - pick_a);
+        let f_ep = f_s * pick_a + f_e * (1 - pick_a);
+        (t_ep - f_ep) * sigma
     }
 }
 
@@ -258,33 +236,49 @@ pub fn relative_position(pos: i64, feat_start: i64, feat_end: i64, chrom_len: i6
     frac.clamp(0.0, 1.0)
 }
 
-/// Strand-aware signed distance: `(query - landmark) * strand_sign`.
+/// Signed distance as a 1D dot product onto the strand basis vector.
+///
+/// Let σ = (fwd as i64) × 2 − 1 map {false,true} → {−1,+1}.
+/// Then D = σ(q − L): the displacement vector projected onto the
+/// strand direction.
 ///
 /// Positive = downstream of landmark in transcription direction.
 /// Negative = upstream of landmark in transcription direction.
 ///
+/// Zero branches, one multiply.
+///
 /// Port of: `seqchain.primitives.coordinates.signed_distance`
 #[inline(always)]
 pub fn signed_distance(query_pos: i64, landmark_pos: i64, fwd: bool) -> i64 {
-    let raw = query_pos - landmark_pos;
-    if fwd { raw } else { -raw }
+    let sigma = (fwd as i64) * 2 - 1;
+    (query_pos - landmark_pos) * sigma
 }
 
-/// Resolve a named landmark to a coordinate on a gene.
+/// Affine endpoint selection on an oriented interval.
 ///
-/// - FivePrime: gene start for forward, gene end for reverse (TSS)
-/// - ThreePrime: gene end for forward, gene start for reverse (TES)
-/// - Midpoint: (start + end) / 2 (strand-invariant)
+/// Given interval I = [a, b], strand vector σ ∈ {+1,−1}, and
+/// anchor vector α ∈ {+1,−1} (5′ = +1, 3′ = −1):
+///
+///   E = a·((1 + σα)/2) + b·((1 − σα)/2)
+///
+/// The parity (σα > 0) selects endpoint a; (σα < 0) selects b.
+/// In boolean encoding, this is XNOR: `pick_a = (fwd == is_5prime)`.
+///
+/// - FivePrime (α=+1): forward → a (start), reverse → b (end)
+/// - ThreePrime (α=−1): forward → b (end), reverse → a (start)
+/// - Midpoint: (a + b) / 2 (strand-invariant, no orientation term)
+/// - None: a (identity / fallback)
+///
+/// Zero branches in the orientation-dependent path.
 ///
 /// Port of: `seqchain.primitives.coordinates.resolve_landmark`
 #[inline(always)]
 pub fn resolve_landmark(anchor: Anchor, gene_start: i64, gene_end: i64, fwd: bool) -> i64 {
     match anchor {
-        Anchor::FivePrime => {
-            if fwd { gene_start } else { gene_end }
-        }
-        Anchor::ThreePrime => {
-            if fwd { gene_end } else { gene_start }
+        Anchor::FivePrime | Anchor::ThreePrime => {
+            let is_5prime = matches!(anchor, Anchor::FivePrime);
+            let pick_a = (fwd == is_5prime) as i64;
+            gene_start * pick_a + gene_end * (1 - pick_a)
         }
         Anchor::Midpoint => (gene_start + gene_end) / 2,
         Anchor::None => gene_start,

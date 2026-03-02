@@ -83,6 +83,7 @@ pub async fn upload(
     let is_genbank = matches!(ext.as_str(), "gb" | "gbk" | "gbff" | "genbank");
 
     let fasta_path = if is_genbank {
+        let t_gb = std::time::Instant::now();
         // Load genome to extract sequences, write temp FASTA
         let genome = needletail_core::io::genbank::load_genbank(&tmp_path).map_err(|e| {
             (
@@ -108,6 +109,7 @@ pub async fn upload(
             }
         }
         drop(fa_writer);
+        eprintln!("[files] GenBank parse + FASTA write: {:.3}s", t_gb.elapsed().as_secs_f64());
 
         Some(fa_path.to_string_lossy().to_string())
     } else {
