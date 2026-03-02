@@ -84,7 +84,7 @@ impl From<CrisprYaml> for CRISPRPreset {
             spacer_len: y.spacer_len,
             pam_direction: y.pam_direction,
             description: y.description.trim().to_string(),
-            mismatches: 0,
+            mismatches: 2,
         }
     }
 }

@@ -677,6 +677,22 @@ pub fn sa_sweep_build(sa: &[usize], text: &[u8], k: usize) -> (KmerSeedTable, Po
     }
 
     // Phase 2: Build both tables from runs.
+    let total_positions: usize = runs.iter().map(|&(_, s, e)| e - s).sum();
+    let seed_bytes = if k <= SPARSE_THRESHOLD {
+        table_size(k) * 8
+    } else {
+        16 + runs.len() * 12
+    };
+    let pos_bytes = if k <= SPARSE_THRESHOLD {
+        (table_size(k) + 1) * 4 + total_positions * 4
+    } else {
+        runs.len() * 12 + total_positions * 4
+    };
+    eprintln!("[sa_sweep] K={}: {} distinct k-mers, {} positions, seed={:.1}MB, pos={:.1}MB, total={:.1}MB",
+        k, runs.len(), total_positions,
+        seed_bytes as f64 / 1048576.0,
+        pos_bytes as f64 / 1048576.0,
+        (seed_bytes + pos_bytes) as f64 / 1048576.0);
     let is_dense = k <= SPARSE_THRESHOLD;
 
     // ── KmerSeedTable ──────────────────────────────────────────────────────

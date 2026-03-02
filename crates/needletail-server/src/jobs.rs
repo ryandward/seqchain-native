@@ -244,6 +244,11 @@ impl JobManager {
         }
     }
 
+    /// Remove a job by ID (frees memory for completed/consumed jobs).
+    pub fn remove(&self, id: &str) -> bool {
+        self.jobs.remove(id).is_some()
+    }
+
     /// List all job IDs with their statuses.
     pub fn list(&self) -> Vec<(String, String, JobStatus)> {
         self.jobs

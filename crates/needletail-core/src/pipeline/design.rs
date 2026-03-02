@@ -179,6 +179,7 @@ pub fn design_library(
 
     // Search all unique spacers
     progress.set_items(0, unique_spacers.len());
+    let t_score = std::time::Instant::now();
     let hit_counts = if !unique_spacers.is_empty() {
         score_spacers(
             &unique_spacers,
@@ -193,6 +194,8 @@ pub fn design_library(
     } else {
         vec![]
     };
+    eprintln!("[pipeline] score_spacers: {:.3}s ({} unique, mm={})",
+        t_score.elapsed().as_secs_f64(), unique_spacers.len(), preset.mismatches);
 
     // ── Build scored guide Regions ────────────────────────────────────────────
     progress.set_stage("Building scored regions");

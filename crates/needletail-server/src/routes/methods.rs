@@ -75,7 +75,7 @@ fn method_catalog() -> Vec<Value> {
                 "type": "string",
                 "required": false,
                 "description": "Max mismatches for off-target scoring (0-3)",
-                "default": "0",
+                "default": "2",
             },
         ],
         "returns": {
@@ -231,6 +231,12 @@ async fn dispatch_design_library(
     })?;
 
     let job_id = state.jobs.submit(genome, preset, feature_config);
+
+    // Evict genome from store — the job's Arc keeps it alive for the
+    // pipeline run. Once the job finishes, the last Arc drops and the
+    // ~400 MB of index data is freed. Without this, every upload
+    // accumulates permanently in RAM.
+    state.genomes.remove(genome_id);
 
     Ok((StatusCode::ACCEPTED, Json(json!({ "job_id": job_id }))))
 }

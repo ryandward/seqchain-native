@@ -89,11 +89,15 @@ impl GenomeStore {
             eprintln!("[upload] FM-Index build: {:.3}s", t_idx.elapsed().as_secs_f64());
 
             let t_seed = Instant::now();
-            let (ts, tl) = needletail_core::build_seed_tiers(&*searcher, searcher.text(), file_path)
-                .map_err(|e| e.to_string())?;
-            eprintln!("[upload] seed tiers: {:.3}s", t_seed.elapsed().as_secs_f64());
+            let ts = needletail_core::build_seed_tier_for_handle(
+                &IndexHandle::Built(searcher.clone()), searcher.text(), file_path,
+                needletail_core::SEED_K_SMALL,
+            );
+            eprintln!("[upload] seed tier K={}: {:.3}s", needletail_core::SEED_K_SMALL, t_seed.elapsed().as_secs_f64());
 
-            (IndexHandle::Built(searcher), Some(ts), Some(tl))
+            // K=14 tier skipped: only 8% faster scoring but +293 MB RAM.
+            // mm=3 falls back to K=10 seeding automatically.
+            (IndexHandle::Built(searcher), ts, None)
         };
 
         eprintln!("[upload] total: {:.3}s", t0.elapsed().as_secs_f64());

@@ -107,8 +107,10 @@ pub async fn stream(
         ));
     }
 
-    let result = job.result.lock().unwrap();
-    match result.as_ref() {
+    // Take the result out of the job — frees the LibraryResult memory
+    // after serialisation. Each result holds ~100 MB of guide Regions.
+    let taken = job.result.lock().unwrap().take();
+    match taken {
         Some(Ok(lib_result)) => {
             // Build streaming JSON array
             let mut chunks: Vec<String> = Vec::with_capacity(lib_result.guides.len() + 2);
@@ -121,6 +123,14 @@ pub async fn stream(
                 chunks.push(serde_json::to_string(&j).unwrap_or_default());
             }
             chunks.push("]".to_string());
+
+            // Drop lib_result before building response — frees guides memory
+            drop(lib_result);
+
+            // Drop our Arc reference, then evict the job from the store.
+            // This frees all job metadata + the now-empty result slot.
+            drop(job);
+            state.jobs.remove(&id);
 
             let body = chunks.join("");
             let mut response = Response::new(Body::from(body));
@@ -136,7 +146,7 @@ pub async fn stream(
         )),
         None => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "no result available" })),
+            Json(json!({ "error": "result already consumed or not available" })),
         )),
     }
 }
