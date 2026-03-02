@@ -15,20 +15,55 @@ use serde_json::{json, Map, Value};
 use crate::models::region::{Region, TagValue};
 use super::RegionSink;
 
-/// Convert a Region to a JSON value.
+// Fields that are internal pipeline state — never exposed in output.
+const HIDDEN_TAGS: &[&str] = &["landmark", "gene_strand"];
+
+// Canonical output field order. Fields are emitted in this sequence;
+// any tag not listed here comes after, in iteration order.
+const FIELD_ORDER: &[&str] = &[
+    // position
+    "chrom", "start", "end", "strand",
+    // guide identity
+    "guide_id", "guide_seq", "spacer", "pam_seq",
+    // off-target quality
+    "score", "off_targets", "total_hits",
+    // feature context
+    "feature_type", "feature_name", "feature_strand",
+    "feature_start", "feature_end",
+    // positional within feature
+    "signed_distance", "relative_pos", "offset", "overlap",
+];
+
+/// Convert a Region to a JSON value with fields in semantic order.
 pub fn region_to_json(r: &Region) -> Value {
     let mut obj = Map::new();
 
-    obj.insert("chrom".into(), json!(r.chrom));
-    obj.insert("start".into(), json!(r.start));
-    obj.insert("end".into(), json!(r.end));
-    obj.insert("strand".into(), json!(r.strand.as_str()));
-    obj.insert("score".into(), sanitize_float(r.score));
-    obj.insert("name".into(), json!(r.name));
+    // Collect all tag values, excluding internal fields.
+    let mut tags: std::collections::HashMap<&str, Value> = r.tags
+        .iter()
+        .filter(|(k, _)| !HIDDEN_TAGS.contains(&k.as_str()))
+        .map(|(k, v)| (k.as_str(), tag_value_to_json(v)))
+        .collect();
 
-    // Flatten tags into the object
-    for (key, val) in &r.tags {
-        obj.insert(key.clone(), tag_value_to_json(val));
+    // Seed with the fixed Region fields so they participate in ordering.
+    let fixed: std::collections::HashMap<&str, Value> = [
+        ("chrom",  json!(r.chrom)),
+        ("start",  json!(r.start)),
+        ("end",    json!(r.end)),
+        ("strand", json!(r.strand.as_str())),
+        ("score",  sanitize_float(r.score)),
+    ].into();
+
+    // Emit in canonical order, drawing from fixed fields first, then tags.
+    for &field in FIELD_ORDER {
+        if let Some(v) = fixed.get(field).cloned().or_else(|| tags.remove(field)) {
+            obj.insert(field.into(), v);
+        }
+    }
+
+    // Any remaining tags not in FIELD_ORDER come last.
+    for (k, v) in tags {
+        obj.insert(k.into(), v);
     }
 
     Value::Object(obj)
@@ -177,8 +212,8 @@ mod tests {
         let json_str = regions_to_json_string(&regions);
         let parsed: Vec<Value> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0]["name"], "a");
-        assert_eq!(parsed[1]["name"], "b");
+        assert_eq!(parsed[0]["chrom"], "chr1");
+        assert_eq!(parsed[1]["chrom"], "chr1");
     }
 
     #[test]
@@ -198,7 +233,7 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&contents).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0]["name"], "g1");
-        assert_eq!(parsed[1]["name"], "g2");
+        assert_eq!(parsed[0]["chrom"], "chr1");
+        assert_eq!(parsed[1]["chrom"], "chr1");
     }
 }

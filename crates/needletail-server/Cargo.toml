@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 needletail-core = { path = "../needletail-core" }
 axum            = "0.8"
+rayon           = "1"
 tokio           = { version = "1", features = ["full"] }
 dashmap         = "6"
 uuid            = { version = "1", features = ["v4"] }

@@ -29,5 +29,4 @@ features:
     priority: 3
     anchor: three_prime
 
-default_feature: intergenic
-priority: [gene_body, promoter, terminator, intergenic]
+priority: [gene_body, promoter, terminator]

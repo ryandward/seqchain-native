@@ -124,7 +124,6 @@ pub struct FeatureDefinition {
 pub struct FeatureConfig {
     pub organism: String,
     pub features: Vec<FeatureDefinition>,
-    pub default_feature: String,
 }
 
 /// Raw YAML shape for a single feature definition.
@@ -143,7 +142,6 @@ struct FeatureDefYaml {
 struct FeatureYaml {
     organism: String,
     features: HashMap<String, FeatureDefYaml>,
-    default_feature: String,
     #[serde(default)]
     priority: Vec<String>,
 }
@@ -178,7 +176,6 @@ impl From<FeatureYaml> for FeatureConfig {
         FeatureConfig {
             organism: y.organism,
             features: defs,
-            default_feature: y.default_feature,
         }
     }
 }
@@ -400,7 +397,6 @@ mod tests {
         assert_eq!(c.features[0].name, "gene_body");
         assert_eq!(c.features[1].name, "promoter");
         assert_eq!(c.features[1].max_distance, 500);
-        assert_eq!(c.default_feature, "intergenic");
     }
 
     #[test]

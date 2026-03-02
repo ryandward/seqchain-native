@@ -17,5 +17,5 @@ parquet  = { version = "54", default-features = false, features = ["arrow", "sna
 gb-io    = "0.7"
 flate2   = "1"
 serde       = { version = "1", features = ["derive"] }
-serde_json  = "1"
+serde_json  = { version = "1", features = ["preserve_order"] }
 serde_yaml  = "0.9"

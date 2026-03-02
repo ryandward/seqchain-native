@@ -1,5 +1,11 @@
-//! Feature tiling — tile genome into promoter/gene_body/terminator/intergenic
-//! regions using a sliding window over sorted genes.
+//! Feature tiling — tile genome into promoter/gene_body/terminator regions
+//! using a sliding window over sorted genes.
+//!
+//! Landmark Logic: a tile is only emitted if it carries a gravitational centre
+//! (a gene anchor with a `landmark` coordinate).  Empty space — gaps with no
+//! regulatory claim — produces no tile.  Guides that fall in the void stream
+//! through the sink bearing only their geometric properties; they are never
+//! falsely labelled "intergenic".
 //!
 //! Port of: `seqchain.operations.annotate.feature.annotate_features`
 
@@ -42,12 +48,7 @@ pub fn annotate_features(
                 sorted
             }
             None => {
-                // No genes on this chromosome: entire chromosome is intergenic
-                result.push(
-                    Region::new(chrom, 0, chrom_len)
-                        .with_name(&config.default_feature)
-                        .with_tag("feature_type", config.default_feature.clone()),
-                );
+                // No genes on this chromosome: no landmarks, no tiles.
                 continue;
             }
         };
@@ -182,12 +183,8 @@ fn fill_gap(
     }
 
     if claims.is_empty() {
-        // Entire gap is intergenic
-        return vec![
-            Region::new(chrom, gap_start, gap_end)
-                .with_name(&config.default_feature)
-                .with_tag("feature_type", config.default_feature.clone()),
-        ];
+        // No regulatory claims reach this gap — no landmark, no tile.
+        return vec![];
     }
 
     // Sort claims by priority (lower = higher priority)
@@ -225,7 +222,7 @@ fn fill_gap(
                 gap_start + run_start as i64,
                 gap_start + i as i64,
                 run_assign,
-                config,
+                &config.features,
                 &claims,
                 &claim_genes,
                 &mut regions,
@@ -240,7 +237,7 @@ fn fill_gap(
         gap_start + run_start as i64,
         gap_end,
         run_assign,
-        config,
+        &config.features,
         &claims,
         &claim_genes,
         &mut regions,
@@ -250,27 +247,22 @@ fn fill_gap(
 }
 
 /// Emit a region for a contiguous run in the gap.
-#[allow(clippy::too_many_arguments)]
 fn emit_gap_region(
     chrom: &str,
     start: i64,
     end: i64,
     assignment: Option<usize>,
-    config: &FeatureConfig,
+    features: &[FeatureDefinition],
     claims: &[(i32, i64, i64, usize, &Region)],
     claim_genes: &HashMap<(usize, i64, i64), &Region>,
     out: &mut Vec<Region>,
 ) {
     match assignment {
         None => {
-            out.push(
-                Region::new(chrom, start, end)
-                    .with_name(&config.default_feature)
-                    .with_tag("feature_type", config.default_feature.clone()),
-            );
+            // Gap position has no regulatory assignment — emit nothing.
         }
         Some(def_idx) => {
-            let def = &config.features[def_idx];
+            let def = &features[def_idx];
 
             // Find the gene associated with this claim
             let source_gene = claims
@@ -382,18 +374,13 @@ mod tests {
 
     #[test]
     fn test_annotate_features_no_genes() {
+        // No genes → no landmarks → no tiles.  The void is silent.
         let config = make_config();
         let mut sizes = HashMap::new();
         sizes.insert("chr1", 5000usize);
 
         let tiles = annotate_features(&[], &config, &sizes);
-        assert_eq!(tiles.len(), 1);
-        assert_eq!(
-            tiles[0].tags["feature_type"].as_str(),
-            Some("intergenic")
-        );
-        assert_eq!(tiles[0].start, 0);
-        assert_eq!(tiles[0].end, 5000);
+        assert_eq!(tiles.len(), 0);
     }
 
     #[test]

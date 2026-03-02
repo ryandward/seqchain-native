@@ -309,9 +309,11 @@ pub fn design_library(
     );
 
     // Terminal drain: sweep → TSS distance → sink.  No collect().
-    // Report progress every ~1% so GenomeHub's polling sees a smooth bar.
-    let drain_report_interval = (total_guides_scored / 100).max(1000);
+    // Progress is reported on a ~10Hz clock (every 100 ms) rather than on
+    // a fixed item count.  The modulo guard avoids a syscall per guide —
+    // we only sample the clock every 1 000 items.
     let mut guides_written: usize = 0;
+    let mut last_progress_report = std::time::Instant::now();
     progress.set_items(0, total_guides_scored);
     for mut region in annotator {
         // Compute TSS distance for regions that have a landmark
@@ -333,8 +335,13 @@ pub fn design_library(
         sink.consume(region).map_err(|e| format!("sink error: {}", e))?;
         guides_written += 1;
 
-        if guides_written % drain_report_interval == 0 {
+        // Gate the clock read to every 1 000 items to avoid syscall overhead,
+        // then emit a progress update at most every 100 ms (~10 Hz).
+        if guides_written % 1_000 == 0
+            && last_progress_report.elapsed().as_millis() >= 100
+        {
             progress.set_items(guides_written, total_guides_scored);
+            last_progress_report = std::time::Instant::now();
         }
     }
 

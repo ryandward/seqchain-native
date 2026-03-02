@@ -2,10 +2,38 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use uuid::Uuid;
+
+/// A Rayon thread pool that deliberately leaves cores free for the Tokio reactor.
+///
+/// Without this, `par_iter` inside `design_library` saturates every logical
+/// core and starves the async executor — the 10Hz HTTP poll from GenomeHub
+/// never gets scheduled.
+static COMPUTE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+fn compute_pool() -> &'static rayon::ThreadPool {
+    COMPUTE_POOL.get_or_init(|| {
+        // Leave 2 cores for Tokio (1 minimum if the machine has ≤ 3 cores).
+        let total = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let compute = total.saturating_sub(2).max(1);
+        eprintln!(
+            "[pool] Rayon compute pool: {} threads ({} total cores, {} reserved for Tokio)",
+            compute,
+            total,
+            total - compute,
+        );
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(compute)
+            .thread_name(|i| format!("needletail-compute-{}", i))
+            .build()
+            .expect("failed to build Rayon compute pool")
+    })
+}
 
 use needletail_core::io::json::FileSink;
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
@@ -201,16 +229,21 @@ impl JobManager {
 
             let result = match sink_result {
                 Ok(mut sink) => {
-                    let pipeline_result = design::design_library(
-                        &genome.genome,
-                        &genome.index,
-                        genome.tier_small.as_ref(),
-                        genome.tier_large.as_ref(),
-                        &preset,
-                        &feature_config,
-                        &*progress,
-                        &mut sink,
-                    );
+                    // Run the CPU-bound pipeline inside the quarantined Rayon
+                    // pool.  This ensures the global Rayon pool (and therefore
+                    // the Tokio reactor's threads) are never crowded out.
+                    let pipeline_result = compute_pool().install(|| {
+                        design::design_library(
+                            &genome.genome,
+                            &genome.index,
+                            genome.tier_small.as_ref(),
+                            genome.tier_large.as_ref(),
+                            &preset,
+                            &feature_config,
+                            &*progress,
+                            &mut sink,
+                        )
+                    });
 
                     // Finish the file (write closing `]`) on success
                     match pipeline_result {
