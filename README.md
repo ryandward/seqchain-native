@@ -2,8 +2,6 @@
   <img src="logo.png" alt="Needletail" width="500">
 </p>
 
-<h1 align="center">Needletail</h1>
-
 <p align="center"><strong>A SIMD-accelerated FM-Index aligner for CRISPR guide design.</strong></p>
 
 Needletail is a Rust + PyO3 short-read aligner purpose-built for the
