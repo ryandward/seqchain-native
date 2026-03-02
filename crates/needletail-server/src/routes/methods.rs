@@ -31,8 +31,8 @@ use crate::AppState;
 fn method_catalog() -> Vec<Value> {
     vec![json!({
         "id": "design_library",
-        "name": "Promoter Guide Design",
-        "description": "Design a CRISPR guide library targeting gene promoters. Scans for PAM sites across all annotated promoter regions, scores off-target hits via FM-Index search, and returns only guides that fall within promoter tiles.",
+        "name": "Whole Genome Library Design",
+        "description": "Design a whole-genome CRISPR guide library. Scans for PAM sites across the entire genome, scores off-target hits via FM-Index search, and annotates all guides against feature tiles via sweep-line. Downstream consumers filter for biology.",
         "async": true,
         "parameters": [
             {
@@ -80,13 +80,13 @@ fn method_catalog() -> Vec<Value> {
         ],
         "returns": {
             "type": "file",
-            "description": "Scored promoter guide library",
+            "description": "Annotated whole-genome guide library",
         },
         "steps": [
-            { "key": "indexing",   "label": "Building FM-Index" },
-            { "key": "scanning",   "label": "Scanning genome" },
-            { "key": "scoring",    "label": "Scoring & annotation" },
-            { "key": "filtering",  "label": "Filtering library" },
+            { "key": "indexing",    "label": "Building FM-Index" },
+            { "key": "scanning",    "label": "Scanning genome" },
+            { "key": "scoring",     "label": "Scoring off-targets" },
+            { "key": "annotation",  "label": "Annotating & streaming" },
         ],
     })]
 }

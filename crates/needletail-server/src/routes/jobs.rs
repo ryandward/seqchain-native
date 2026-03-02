@@ -15,8 +15,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::Json;
 use serde_json::{json, Value};
-
-use needletail_core::io::json::region_to_json;
+use tokio_util::io::ReaderStream;
 
 use crate::jobs::JobStatus;
 use crate::AppState;
@@ -87,7 +86,8 @@ pub async fn status(
 /// Stream the completed job result.
 ///
 /// Called once by GenomeHub after status reaches "complete".
-/// Returns streaming JSON array with Content-Disposition header.
+/// Streams the result file directly from disk — zero RAM.
+/// Deletes the file and evicts the job after streaming.
 pub async fn stream(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -107,44 +107,48 @@ pub async fn stream(
         ));
     }
 
-    // Take the result out of the job — frees the LibraryResult memory
-    // after serialisation. Each result holds ~100 MB of guide Regions.
-    let taken = job.result.lock().unwrap().take();
-    match taken {
-        Some(Ok(lib_result)) => {
-            // Build streaming JSON array
-            let mut chunks: Vec<String> = Vec::with_capacity(lib_result.guides.len() + 2);
-            chunks.push("[".to_string());
-            for (i, guide) in lib_result.guides.iter().enumerate() {
-                let j = region_to_json(guide);
-                if i > 0 {
-                    chunks.push(",".to_string());
-                }
-                chunks.push(serde_json::to_string(&j).unwrap_or_default());
-            }
-            chunks.push("]".to_string());
+    // Take the result path — file on disk written by FileSink.
+    let result_path = job.result_path.lock().unwrap().take();
+    let taken_result = job.result.lock().unwrap().take();
 
-            // Drop lib_result before building response — frees guides memory
-            drop(lib_result);
+    match (result_path, taken_result) {
+        (Some(path), Some(Ok(_lib_result))) => {
+            // Open the file for async streaming
+            let file = tokio::fs::File::open(&path).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to open result file: {}", e) })),
+                )
+            })?;
 
-            // Drop our Arc reference, then evict the job from the store.
-            // This frees all job metadata + the now-empty result slot.
+            let stream = ReaderStream::new(file);
+            let body = Body::from_stream(stream);
+
+            // Evict the job from the store.
             drop(job);
             state.jobs.remove(&id);
 
-            let body = chunks.join("");
-            let mut response = Response::new(Body::from(body));
+            // Schedule file cleanup after response is sent.
+            // The file stays on disk until the stream completes.
+            let cleanup_path = path.clone();
+            tokio::spawn(async move {
+                // Give the response time to finish streaming
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::fs::remove_file(&cleanup_path).await.ok();
+            });
+
+            let mut response = Response::new(body);
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
             Ok(response)
         }
-        Some(Err(e)) => Err((
+        (_, Some(Err(e))) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
         )),
-        None => Err((
+        _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "result already consumed or not available" })),
         )),

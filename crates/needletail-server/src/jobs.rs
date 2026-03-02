@@ -1,12 +1,13 @@
 //! Background job management for pipeline execution.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-
 
 use dashmap::DashMap;
 use uuid::Uuid;
 
+use needletail_core::io::json::FileSink;
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
 use needletail_core::pipeline::design::{self, LibraryResult, ProgressSink};
 
@@ -96,6 +97,9 @@ pub struct Job {
     pub status: std::sync::Mutex<JobStatus>,
     pub progress: Arc<JobProgress>,
     pub result: std::sync::Mutex<Option<Result<LibraryResult, String>>>,
+    /// Path to the JSONL result file on disk.  The pipeline drains guides
+    /// directly to this file via FileSink — zero RAM accumulation.
+    pub result_path: std::sync::Mutex<Option<PathBuf>>,
     pub error: std::sync::Mutex<Option<String>>,
     pub guides_complete: AtomicUsize,
     pub chroms_complete: AtomicUsize,
@@ -166,6 +170,7 @@ impl JobManager {
             status: std::sync::Mutex::new(JobStatus::Queued),
             progress: progress.clone(),
             result: std::sync::Mutex::new(None),
+            result_path: std::sync::Mutex::new(None),
             error: std::sync::Mutex::new(None),
             guides_complete: AtomicUsize::new(0),
             chroms_complete: AtomicUsize::new(0),
@@ -177,6 +182,7 @@ impl JobManager {
         self.jobs.insert(job_id.clone(), job.clone());
 
         // Spawn blocking task
+        let jid = job_id.clone();
         tokio::task::spawn_blocking(move || {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -185,15 +191,45 @@ impl JobManager {
             job.started_at.store(now_ms, Ordering::Release);
             *job.status.lock().unwrap() = JobStatus::Running;
 
-            let result = design::design_library(
-                &genome.genome,
-                &genome.index,
-                genome.tier_small.as_ref(),
-                genome.tier_large.as_ref(),
-                &preset,
-                &feature_config,
-                &*progress,
-            );
+            // Create results directory and FileSink.
+            let results_dir = PathBuf::from("/tmp/needletail-results");
+            std::fs::create_dir_all(&results_dir).ok();
+            let file_path = results_dir.join(format!("{}.json", jid));
+
+            let sink_result = FileSink::create(&file_path)
+                .map_err(|e| format!("failed to create result file: {}", e));
+
+            let result = match sink_result {
+                Ok(mut sink) => {
+                    let pipeline_result = design::design_library(
+                        &genome.genome,
+                        &genome.index,
+                        genome.tier_small.as_ref(),
+                        genome.tier_large.as_ref(),
+                        &preset,
+                        &feature_config,
+                        &*progress,
+                        &mut sink,
+                    );
+
+                    // Finish the file (write closing `]`) on success
+                    match pipeline_result {
+                        Ok(lib) => {
+                            match sink.finish() {
+                                Ok(_) => Ok(lib),
+                                Err(e) => Err(format!("failed to finalize result file: {}", e)),
+                            }
+                        }
+                        Err(e) => {
+                            // Clean up partial file on failure
+                            drop(sink);
+                            std::fs::remove_file(&file_path).ok();
+                            Err(e)
+                        }
+                    }
+                }
+                Err(e) => Err(e),
+            };
 
             let end_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -204,10 +240,11 @@ impl JobManager {
             match &result {
                 Ok(ref lib) => {
                     job.guides_complete
-                        .store(lib.guides.len(), Ordering::Release);
+                        .store(lib.guides_written, Ordering::Release);
                     job.chroms_complete
                         .store(job.chroms_total.load(Ordering::Acquire), Ordering::Release);
                     *job.status.lock().unwrap() = JobStatus::Complete;
+                    *job.result_path.lock().unwrap() = Some(file_path);
                 }
                 Err(e) => {
                     if e == "cancelled" {

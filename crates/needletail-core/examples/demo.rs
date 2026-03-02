@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use needletail_core::engine::fm_index::ChromInfo;
 use needletail_core::io::genbank::load_genbank;
-use needletail_core::io::json::region_to_json;
+use needletail_core::io::json::FileSink;
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
 use needletail_core::pipeline::design::{design_library, NullProgress};
 use needletail_core::{FmIndexSearcher, IndexHandle, build_seed_tiers};
@@ -34,18 +34,17 @@ fn main() {
     let preset = CRISPRPreset::by_name("spcas9").expect("spcas9 preset not found");
     let config = FeatureConfig::by_name("saccer3").expect("saccer3 feature config not found");
 
+    let out_path = Path::new("/tmp/needletail-demo-output.json");
     let t0 = std::time::Instant::now();
+    let mut sink = FileSink::create(out_path).expect("failed to create output file");
     let result = design_library(
         &genome, &handle, Some(&ts), Some(&tl),
-        &preset, &config, &NullProgress,
+        &preset, &config, &NullProgress, &mut sink,
     ).unwrap();
     let elapsed = t0.elapsed();
+    sink.finish().expect("failed to finalize output file");
 
-    eprintln!("Pipeline: {:.2?} — {} promoter guides from {} scored",
-        elapsed, result.guides.len(), result.total_guides_scored);
-
-    for guide in result.guides.iter().take(10) {
-        let j = region_to_json(guide);
-        println!("{}", serde_json::to_string_pretty(&j).unwrap());
-    }
+    eprintln!("Pipeline: {:.2?} — {} guides written from {} scored → {}",
+        elapsed, result.guides_written, result.total_guides_scored,
+        out_path.display());
 }
