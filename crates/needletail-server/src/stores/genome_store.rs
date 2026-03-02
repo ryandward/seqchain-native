@@ -50,7 +50,9 @@ impl GenomeStore {
             .unwrap_or("");
 
         // Load genome
-        let mut genome = if ext == "gb" || file_path.ends_with(".gb.gz") {
+        let is_genbank = matches!(ext, "gb" | "gbk" | "gbff" | "genbank")
+            || file_path.ends_with(".gb.gz");
+        let mut genome = if is_genbank {
             load_genbank(path)?
         } else {
             load_fasta(path, None)?
