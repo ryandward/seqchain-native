@@ -299,8 +299,8 @@ pub fn design_library(
         .collect();
 
     progress.set_items(promoter_guides.len(), promoter_guides.len());
-    progress.set_stage("Complete");
-    progress.report("done", 8, 8);
+    progress.set_stage(&format!("Selected {} promoter guides", promoter_guides.len()));
+    progress.report("filtering", 8, 8);
 
     Ok(LibraryResult {
         guides: promoter_guides,
