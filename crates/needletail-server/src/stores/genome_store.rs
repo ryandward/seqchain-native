@@ -52,10 +52,13 @@ impl GenomeStore {
         // Load genome
         let is_genbank = matches!(ext, "gb" | "gbk" | "gbff" | "genbank")
             || file_path.ends_with(".gb.gz");
+        let is_fasta = matches!(ext, "fa" | "fasta" | "fna" | "fas");
         let mut genome = if is_genbank {
             load_genbank(path)?
-        } else {
+        } else if is_fasta {
             load_fasta(path, None)?
+        } else {
+            return Err(format!("Unrecognized file extension: .{ext}"));
         };
         let t_parse = t0.elapsed();
         eprintln!("[upload] genome parse: {:.3}s", t_parse.as_secs_f64());
