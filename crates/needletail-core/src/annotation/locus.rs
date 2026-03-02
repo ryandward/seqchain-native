@@ -69,7 +69,7 @@ pub fn annotate_locus_from_features(
         annotated.tags.insert("relative_pos".into(), TagValue::Float(rel_pos));
 
         // Copy optional feature tags
-        for key in &["locus_tag", "gene", "product"] {
+        for key in &["locus_tag", "gene", "product", "landmark", "gene_strand"] {
             if let Some(val) = feat.tags.get(*key) {
                 annotated.tags.insert((*key).to_string(), val.clone());
             }
