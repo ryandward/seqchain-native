@@ -1,79 +1,131 @@
 //! Sweep-line annotation — join guides against feature tiles using a
 //! sorted-merge algorithm with an active window deque.
 //!
-//! Port of: `seqchain.operations.annotate.sweep.sorted_overlap_annotate`
+//! `SweepAnnotator` is a lazy Iterator: it yields one annotated Region at a
+//! time without collecting the full result set into memory.  Downstream
+//! consumers (filter, map, collect) compose zero-cost on top.
 
 use std::collections::VecDeque;
 
 use crate::models::region::Region;
 
-use super::locus::annotate_locus_from_features;
+use super::locus::annotate_locus_in_place;
 
-/// Annotate regions by sweeping them against sorted feature tiles.
-///
-/// Both `regions` and `features` must be sorted by (chrom, start).
-/// Uses a deque-based active window: O(active_window) memory, not O(total).
-///
-/// For each region, finds overlapping features on the same chromosome
-/// and delegates coordinate math to `annotate_locus_from_features`.
-pub fn sorted_overlap_annotate(
-    regions: &[Region],
-    features: &[Region],
-    chrom_len_fn: impl Fn(&str) -> Option<i64>,
-) -> Vec<Region> {
-    let mut results = Vec::with_capacity(regions.len());
-    let mut active: VecDeque<usize> = VecDeque::new(); // indices into features
-    let mut feat_cursor: usize = 0; // next feature to consider
+/// Lazy sweep-line annotator.  Yields one annotated `Region` per call to
+/// `next()`.  The full annotated set never lives in memory simultaneously.
+pub struct SweepAnnotator<'a, F: Fn(&str) -> Option<i64>> {
+    regions: &'a [Region],
+    features: &'a [Region],
+    chrom_len_fn: F,
 
-    for region in regions {
-        // Evict: remove features that are entirely behind the current region
-        while let Some(&front) = active.front() {
-            let f = &features[front];
+    /// Index into `regions` — the next guide to process.
+    region_cursor: usize,
+    /// Index into `features` — next feature to consider adding to the window.
+    feat_cursor: usize,
+    /// Active feature window (indices into `features`).
+    active: VecDeque<usize>,
+
+    /// When a guide overlaps multiple features we buffer the extra annotated
+    /// copies here and drain them before advancing to the next guide.
+    pending: VecDeque<Region>,
+}
+
+impl<'a, F: Fn(&str) -> Option<i64>> SweepAnnotator<'a, F> {
+    pub fn new(regions: &'a [Region], features: &'a [Region], chrom_len_fn: F) -> Self {
+        SweepAnnotator {
+            regions,
+            features,
+            chrom_len_fn,
+            region_cursor: 0,
+            feat_cursor: 0,
+            active: VecDeque::new(),
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+impl<'a, F: Fn(&str) -> Option<i64>> Iterator for SweepAnnotator<'a, F> {
+    type Item = Region;
+
+    fn next(&mut self) -> Option<Region> {
+        // Drain any buffered multi-overlap results first.
+        if let Some(r) = self.pending.pop_front() {
+            return Some(r);
+        }
+
+        // Advance to the next region.
+        if self.region_cursor >= self.regions.len() {
+            return None;
+        }
+
+        let region = &self.regions[self.region_cursor];
+        self.region_cursor += 1;
+
+        // Evict: remove features entirely behind the current region.
+        while let Some(&front) = self.active.front() {
+            let f = &self.features[front];
             if f.chrom != region.chrom || f.end <= region.start {
-                active.pop_front();
+                self.active.pop_front();
             } else {
                 break;
             }
         }
 
-        // Advance: load features whose start < region.end
-        while feat_cursor < features.len() {
-            let f = &features[feat_cursor];
-            // If feature is on a later chromosome, stop
+        // Advance: load features whose start < region.end.
+        while self.feat_cursor < self.features.len() {
+            let f = &self.features[self.feat_cursor];
             if f.chrom > region.chrom {
                 break;
             }
-            // If feature starts at or beyond region end (same chrom), stop
             if f.chrom == region.chrom && f.start >= region.end {
                 break;
             }
-            // If feature is on the same chrom and overlaps (end > region.start),
-            // add to active window
             if f.chrom == region.chrom && f.end > region.start {
-                active.push_back(feat_cursor);
+                self.active.push_back(self.feat_cursor);
             }
-            feat_cursor += 1;
+            self.feat_cursor += 1;
         }
 
-        // Filter: collect features overlapping with region on same chromosome
-        let overlapping: Vec<&Region> = active
-            .iter()
-            .filter_map(|&idx| {
-                let f = &features[idx];
-                if f.chrom == region.chrom && f.start < region.end && f.end > region.start {
-                    Some(f)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Collect overlapping feature indices.
+        let overlapping: Vec<usize> = self.active.iter().copied().filter(|&idx| {
+            let f = &self.features[idx];
+            f.chrom == region.chrom && f.start < region.end && f.end > region.start
+        }).collect();
 
-        let chrom_len = chrom_len_fn(&region.chrom);
-        let annotated = annotate_locus_from_features(region, &overlapping, chrom_len);
-        results.extend(annotated);
+        let chrom_len = (self.chrom_len_fn)(&region.chrom);
+
+        if overlapping.is_empty() {
+            // No overlap — pass through unchanged.
+            Some(region.clone())
+        } else {
+            // First overlap → returned directly.  Extras → buffered in pending.
+            let mut first = region.clone();
+            annotate_locus_in_place(&mut first, &self.features[overlapping[0]], chrom_len);
+
+            for &idx in &overlapping[1..] {
+                let mut extra = region.clone();
+                annotate_locus_in_place(&mut extra, &self.features[idx], chrom_len);
+                self.pending.push_back(extra);
+            }
+
+            Some(first)
+        }
     }
 
-    results
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.regions.len() - self.region_cursor + self.pending.len();
+        (remaining, None) // upper bound unknown due to multi-overlap expansion
+    }
+}
+
+/// Convenience wrapper — returns a collecting Vec for callers that need it.
+/// Prefer using `SweepAnnotator` directly for lazy composition.
+pub fn sorted_overlap_annotate(
+    regions: &[Region],
+    features: &[Region],
+    chrom_len_fn: impl Fn(&str) -> Option<i64>,
+) -> Vec<Region> {
+    SweepAnnotator::new(regions, features, chrom_len_fn).collect()
 }
 
 #[cfg(test)]
@@ -106,7 +158,6 @@ mod tests {
 
         let results = sorted_overlap_annotate(&guides, &features, |_| None);
 
-        // Each guide should get annotated against one feature
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].tags["feature_name"].as_str(), Some("promoter_A"));
         assert_eq!(results[1].tags["feature_name"].as_str(), Some("gene_A"));
@@ -126,7 +177,37 @@ mod tests {
 
         let results = sorted_overlap_annotate(&guides, &features, |_| None);
         assert_eq!(results.len(), 1);
-        // No feature_name tag — guide returned unchanged
         assert!(!results[0].tags.contains_key("feature_name"));
+    }
+
+    #[test]
+    fn test_sweep_iterator_lazy() {
+        let guides = vec![
+            Region::new("chr1", 50, 70).with_strand(Strand::Forward),
+            Region::new("chr1", 150, 170).with_strand(Strand::Forward),
+        ];
+
+        let features = vec![
+            Region::new("chr1", 0, 100)
+                .with_strand(Strand::Forward)
+                .with_name("promoter_A")
+                .with_tag("feature_type", "promoter"),
+            Region::new("chr1", 100, 500)
+                .with_strand(Strand::Forward)
+                .with_name("gene_A")
+                .with_tag("feature_type", "gene_body"),
+        ];
+
+        // Use as iterator — filter without collecting all.
+        let promoters: Vec<Region> = SweepAnnotator::new(&guides, &features, |_| None)
+            .filter(|r| {
+                r.tags.get("feature_type")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |t| t == "promoter")
+            })
+            .collect();
+
+        assert_eq!(promoters.len(), 1);
+        assert_eq!(promoters[0].tags["feature_name"].as_str(), Some("promoter_A"));
     }
 }

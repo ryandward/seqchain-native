@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::annotation::feature::annotate_features;
-use crate::annotation::sweep::sorted_overlap_annotate;
+use crate::annotation::sweep::SweepAnnotator;
 use crate::chemistry::{CompiledPam, PamDirection};
 use crate::engine::simd_search::FmOcc;
 use crate::geometry::signed_distance;
@@ -90,6 +90,22 @@ pub fn design_library(
     feature_config: &FeatureConfig,
     progress: &dyn ProgressSink,
 ) -> Result<LibraryResult, String> {
+    fn peak_mb() -> f64 {
+        std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<f64>().ok()))
+            .unwrap_or(0.0) / 1024.0
+    }
+    fn rss_mb() -> f64 {
+        std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<f64>().ok()))
+            .unwrap_or(0.0) / 1024.0
+    }
+    eprintln!("[mem] pipeline start: RSS={:.0}MB peak={:.0}MB", rss_mb(), peak_mb());
+
     // ── Step: indexing (brief — index was built at upload time) ─────────────
     progress.set_step("indexing");
     progress.set_stage("Preparing genome data");
@@ -133,6 +149,7 @@ pub fn design_library(
         direction,
         topo_ref,
     )?;
+    eprintln!("[mem] after PAM scan: RSS={:.0}MB peak={:.0}MB", rss_mb(), peak_mb());
 
     progress.set_stage("Enriching guide hits");
     progress.report("enriching", 3, 7);
@@ -142,6 +159,7 @@ pub fn design_library(
 
     let chrom_ranges = chroms.ranges.clone();
     let guide_hits = enrich_hits(pam_hits, &chrom_names, direction, topo_ref, &chrom_ranges);
+    eprintln!("[mem] after enrich ({} guides): RSS={:.0}MB peak={:.0}MB", guide_hits.count, rss_mb(), peak_mb());
 
     // ── Step: scoring ───────────────────────────────────────────────────────
     progress.set_step("scoring");
@@ -196,6 +214,11 @@ pub fn design_library(
     };
     eprintln!("[pipeline] score_spacers: {:.3}s ({} unique, mm={})",
         t_score.elapsed().as_secs_f64(), unique_spacers.len(), preset.mismatches);
+
+    // Drop dedup structures — no longer needed
+    drop(unique_spacers);
+    drop(spacer_to_idx);
+    eprintln!("[mem] after scoring: RSS={:.0}MB peak={:.0}MB", rss_mb(), peak_mb());
 
     // ── Build scored guide Regions ────────────────────────────────────────────
     progress.set_stage("Building scored regions");
@@ -252,6 +275,7 @@ pub fn design_library(
     }
 
     let total_guides_scored = scored_guides.len();
+    eprintln!("[mem] after {} guide regions: RSS={:.0}MB peak={:.0}MB", total_guides_scored, rss_mb(), peak_mb());
 
     // Sort guides by (chrom, start) for sweep-line
     scored_guides.sort_by(|a, b| a.chrom.cmp(&b.chrom).then(a.start.cmp(&b.start)));
@@ -265,18 +289,20 @@ pub fn design_library(
     }
 
     let chrom_len_map = genome.chrom_length_map();
-    let annotated = sorted_overlap_annotate(&scored_guides, &feature_tiles, |chrom| {
-        chrom_len_map.get(chrom).map(|&len| len as i64)
-    });
 
     // ── Step: filtering ─────────────────────────────────────────────────────
+    // Lazy iterator: sweep-line annotation → promoter filter → TSS distance.
+    // The full annotated set never lives in memory — only the final promoter
+    // guides are materialised.
     progress.set_step("filtering");
-    progress.set_stage("Filtering promoter guides");
-    progress.set_items(0, annotated.len());
+    progress.set_stage("Annotating & filtering promoter guides");
+    progress.clear_items();
     progress.report("filtering", 7, 8);
 
-    let promoter_guides: Vec<Region> = annotated
-        .into_iter()
+    let promoter_guides: Vec<Region> = SweepAnnotator::new(
+            &scored_guides, &feature_tiles, |chrom| {
+                chrom_len_map.get(chrom).map(|&len| len as i64)
+            })
         .filter(|r| {
             r.tags
                 .get("feature_type")
@@ -300,6 +326,8 @@ pub fn design_library(
             r
         })
         .collect();
+    eprintln!("[mem] after annotation+filter ({} promoter guides): RSS={:.0}MB peak={:.0}MB",
+        promoter_guides.len(), rss_mb(), peak_mb());
 
     progress.set_items(promoter_guides.len(), promoter_guides.len());
     progress.set_stage(&format!("Selected {} promoter guides", promoter_guides.len()));

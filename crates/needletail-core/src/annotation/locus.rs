@@ -26,59 +26,68 @@ pub fn annotate_locus_from_features(
     let mut results = Vec::with_capacity(features.len());
 
     for feat in features {
-        let overlap_bp = interval_overlap(
-            region.start,
-            region.end,
-            feat.start,
-            feat.end,
-            chrom_len,
-        );
-
-        let feat_fwd = feat.strand.is_forward();
-        let cl = chrom_len.unwrap_or(0);
-
-        let offset = offset_in_feature(
-            region.start,
-            region.end,
-            feat.start,
-            feat.end,
-            feat_fwd,
-            cl,
-        );
-
-        let rel_pos = relative_position(region.start, feat.start, feat.end, cl);
-
-        // Build annotated region
         let mut annotated = region.clone();
-
-        annotated.tags.insert(
-            "feature_name".into(),
-            TagValue::Str(feat.name.clone()),
-        );
-        if let Some(ft) = feat.tags.get("feature_type") {
-            annotated.tags.insert("feature_type".into(), ft.clone());
-        }
-        annotated.tags.insert("feature_start".into(), TagValue::Int(feat.start));
-        annotated.tags.insert("feature_end".into(), TagValue::Int(feat.end));
-        annotated.tags.insert(
-            "feature_strand".into(),
-            TagValue::Str(feat.strand.as_str().into()),
-        );
-        annotated.tags.insert("overlap".into(), TagValue::Int(overlap_bp));
-        annotated.tags.insert("offset".into(), TagValue::Int(offset));
-        annotated.tags.insert("relative_pos".into(), TagValue::Float(rel_pos));
-
-        // Copy optional feature tags
-        for key in &["locus_tag", "gene", "product", "landmark", "gene_strand"] {
-            if let Some(val) = feat.tags.get(*key) {
-                annotated.tags.insert((*key).to_string(), val.clone());
-            }
-        }
-
+        annotate_locus_in_place(&mut annotated, feat, chrom_len);
         results.push(annotated);
     }
 
     results
+}
+
+/// Annotate a region in-place against a single feature.
+///
+/// Adds annotation tags directly to the region — no clone, no allocation
+/// beyond the tag insertions themselves.
+pub fn annotate_locus_in_place(
+    region: &mut Region,
+    feat: &Region,
+    chrom_len: Option<i64>,
+) {
+    let overlap_bp = interval_overlap(
+        region.start,
+        region.end,
+        feat.start,
+        feat.end,
+        chrom_len,
+    );
+
+    let feat_fwd = feat.strand.is_forward();
+    let cl = chrom_len.unwrap_or(0);
+
+    let offset = offset_in_feature(
+        region.start,
+        region.end,
+        feat.start,
+        feat.end,
+        feat_fwd,
+        cl,
+    );
+
+    let rel_pos = relative_position(region.start, feat.start, feat.end, cl);
+
+    region.tags.insert(
+        "feature_name".into(),
+        TagValue::Str(feat.name.clone()),
+    );
+    if let Some(ft) = feat.tags.get("feature_type") {
+        region.tags.insert("feature_type".into(), ft.clone());
+    }
+    region.tags.insert("feature_start".into(), TagValue::Int(feat.start));
+    region.tags.insert("feature_end".into(), TagValue::Int(feat.end));
+    region.tags.insert(
+        "feature_strand".into(),
+        TagValue::Str(feat.strand.as_str().into()),
+    );
+    region.tags.insert("overlap".into(), TagValue::Int(overlap_bp));
+    region.tags.insert("offset".into(), TagValue::Int(offset));
+    region.tags.insert("relative_pos".into(), TagValue::Float(rel_pos));
+
+    // Copy optional feature tags
+    for key in &["locus_tag", "gene", "product", "landmark", "gene_strand"] {
+        if let Some(val) = feat.tags.get(*key) {
+            region.tags.insert((*key).to_string(), val.clone());
+        }
+    }
 }
 
 #[cfg(test)]
