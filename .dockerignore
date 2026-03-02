@@ -1,0 +1,29 @@
+target/
+.venv/
+.git/
+.github/
+docs/
+test/
+tests/
+bench_*.py
+*.pyc
+__pycache__/
+*.egg-info/
+
+# Large index and benchmark artifacts
+*.seqchain
+*.10mer.idx
+*.14mer.idx
+*mmap*.idx
+*.json
+!Cargo.lock
+
+# Python bindings (not needed for server image)
+python/
+crates/needletail-py/
+
+# Editor and IDE
+.idea/
+.vscode/
+*.swp
+*.swo
