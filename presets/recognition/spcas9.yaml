@@ -1,0 +1,8 @@
+type: crispr
+name: SpCas9
+pam: NGG
+spacer_len: 20
+pam_direction: downstream
+description: >
+  Streptococcus pyogenes Cas9. Recognizes NGG PAM downstream of a 20bp
+  spacer. The most widely used CRISPR nuclease.

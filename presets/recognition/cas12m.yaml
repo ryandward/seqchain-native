@@ -1,0 +1,7 @@
+type: crispr
+name: Cas12m
+pam: TTN
+spacer_len: 20
+pam_direction: downstream
+description: >
+  Compact Cas12m nuclease. 5'-TTN-3' PAM downstream of a 20bp spacer.

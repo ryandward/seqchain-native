@@ -329,7 +329,7 @@ mod tests {
     use super::*;
 
     fn make_config() -> FeatureConfig {
-        FeatureConfig::saccer3()
+        FeatureConfig::by_name("saccer3").unwrap()
     }
 
     #[test]

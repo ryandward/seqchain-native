@@ -1,0 +1,33 @@
+# Feature-type definitions for S. cerevisiae (sacCer3).
+#
+# Tiles the genome into gene_body, promoter, terminator, and intergenic
+# regions based on gene coordinates. Smart clipping: regulatory regions
+# never overlap gene bodies.
+#
+# Yeast-specific: short promoters (500bp max) and terminators (200bp max)
+# match the dense yeast genome (~70% ORF, ~400bp median intergenic).
+# Other organisms need different YAMLs (e.g. mouse: 2000bp promoters).
+
+type: feature
+organism: "S. cerevisiae"
+
+features:
+  gene_body:
+    relation: overlap
+    priority: 1
+    anchor: five_prime
+
+  promoter:
+    relation: upstream
+    max_distance: 500
+    priority: 2
+    anchor: five_prime
+
+  terminator:
+    relation: downstream
+    max_distance: 200
+    priority: 3
+    anchor: three_prime
+
+default_feature: intergenic
+priority: [gene_body, promoter, terminator, intergenic]

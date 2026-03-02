@@ -40,8 +40,8 @@ fn main() {
     eprintln!("Warmed seeds ({:.2?})", t0.elapsed());
 
     let handle = IndexHandle::Built(searcher);
-    let preset = CRISPRPreset::spcas9();
-    let config = FeatureConfig::saccer3(); // works for any organism with gene annotations
+    let preset = CRISPRPreset::by_name("spcas9").expect("spcas9 preset not found");
+    let config = FeatureConfig::by_name("saccer3").expect("saccer3 feature config not found");
 
     let t0 = std::time::Instant::now();
     let result = design_library(

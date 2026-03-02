@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! GET    /api/jobs/:id        → status + progress
-//! GET    /api/jobs/:id/stream → result stream (Content-Disposition set)
+//! GET    /api/jobs/:id/stream → result stream (JSON)
 //! DELETE /api/jobs/:id        → cancel (best-effort); always 200
 //! ```
 
@@ -128,10 +128,6 @@ pub async fn stream(
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
-            );
-            response.headers_mut().insert(
-                header::CONTENT_DISPOSITION,
-                HeaderValue::from_static("attachment; filename=\"library.json\""),
             );
             Ok(response)
         }

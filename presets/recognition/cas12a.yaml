@@ -1,0 +1,8 @@
+type: crispr
+name: Cas12a
+pam: TTTN
+spacer_len: 24
+pam_direction: upstream
+description: >
+  Cas12a (Cpf1). Recognizes TTTN PAM upstream of a 24bp spacer.
+  Produces staggered double-strand breaks.
