@@ -53,13 +53,6 @@ pub async fn upload(
 
     let fname = file_name.unwrap_or_else(|| "upload.gb".into());
 
-    // Determine extension for format detection
-    let ext = std::path::Path::new(&fname)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
     // Write to a temp file so the genome store can process it
     let tmp_dir = tempfile::tempdir().map_err(|e| {
         (
@@ -78,60 +71,16 @@ pub async fn upload(
 
     let tmp_str = tmp_path.to_string_lossy().to_string();
 
-    // For GenBank files, we also need a FASTA for FM-index building.
-    // Write a temp FASTA derived from the genome.
-    let is_genbank = matches!(ext.as_str(), "gb" | "gbk" | "gbff" | "genbank");
-
-    let fasta_path = if is_genbank {
-        let t_gb = std::time::Instant::now();
-        // Load genome to extract sequences, write temp FASTA
-        let genome = needletail_core::io::genbank::load_genbank(&tmp_path).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("Failed to parse GenBank: {}", e) })),
-            )
-        })?;
-
-        let fa_path = tmp_dir.path().join("genome.fa");
-        let mut fa_writer = std::io::BufWriter::new(std::fs::File::create(&fa_path).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to create FASTA: {}", e) })),
-            )
-        })?);
-
-        use std::io::Write;
-        for (name, seq) in &genome.sequences {
-            writeln!(fa_writer, ">{}", name).unwrap();
-            for chunk in seq.chunks(80) {
-                fa_writer.write_all(chunk).unwrap();
-                writeln!(fa_writer).unwrap();
-            }
-        }
-        drop(fa_writer);
-        eprintln!("[files] GenBank parse + FASTA write: {:.3}s", t_gb.elapsed().as_secs_f64());
-
-        Some(fa_path.to_string_lossy().to_string())
-    } else {
-        None
-    };
-
-    // Upload into genome store (builds FM-index)
-    let fasta_ref = fasta_path.as_deref().or(Some(tmp_str.as_str()));
+    // Upload into genome store (parses genome + builds FM-index directly)
     let id = state
         .genomes
-        .upload(&tmp_str, fasta_ref, None)
+        .upload(&tmp_str, None)
         .map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": e })),
             )
         })?;
-
-    // Keep temp dir alive by leaking it — the genome store holds Arc refs
-    // to the FM-index which was built from the temp files. The index data
-    // is in memory so the files aren't needed after upload completes.
-    // We can safely let the tempdir drop.
 
     Ok(Json(json!({ "id": id })))
 }

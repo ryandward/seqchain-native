@@ -323,12 +323,12 @@ fn base_idx(b: u8) -> usize {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Metadata for a single chromosome / FASTA record.
-pub(crate) struct ChromInfo {
-    pub(crate) name: String,
+pub struct ChromInfo {
+    pub name: String,
     /// Start offset of this chromosome in the concatenated text.
-    pub(crate) start: usize,
+    pub start: usize,
     /// Length of this chromosome's sequence (excluding the '$' sentinel).
-    pub(crate) len: usize,
+    pub len: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -348,6 +348,48 @@ pub struct FmIndexSearcher {
 }
 
 impl FmIndexSearcher {
+    /// Build an FM-Index from a pre-built master buffer (zero-copy from Genome).
+    ///
+    /// Takes ownership of the text buffer. Builds SA, BWT, BlockRank directly.
+    /// No file I/O, no uppercasing, no concatenation.
+    pub fn from_text(text: Vec<u8>, chroms: Vec<ChromInfo>) -> Result<Self, SearchError> {
+        use std::time::Instant;
+
+        if chroms.is_empty() {
+            return Err(SearchError::Other(anyhow::anyhow!(
+                "No chromosomes provided"
+            )));
+        }
+
+        let t0 = Instant::now();
+        eprintln!("[fm_index] from_text: {} bp, {} chroms",
+            text.len(), chroms.len());
+
+        let t1 = Instant::now();
+        let alphabet = Alphabet::new(b"$ACGTN");
+        let sa = suffix_array(&text);
+        eprintln!("[fm_index] suffix_array (SA-IS): {:.3}s", t1.elapsed().as_secs_f64());
+
+        let t2 = Instant::now();
+        let bwt_seq = bwt(&text, &sa);
+        let less_tbl = less(&bwt_seq, &alphabet);
+        eprintln!("[fm_index] BWT + less: {:.3}s", t2.elapsed().as_secs_f64());
+
+        let t3 = Instant::now();
+        let rank = BlockRank::from_bwt_and_less(&bwt_seq, &less_tbl);
+        eprintln!("[fm_index] BlockRank: {:.3}s ({} blocks)",
+            t3.elapsed().as_secs_f64(), rank.blocks.len());
+
+        eprintln!("[fm_index] total: {:.3}s", t0.elapsed().as_secs_f64());
+
+        Ok(FmIndexSearcher {
+            rank,
+            sa,
+            chroms,
+            text,
+        })
+    }
+
     /// Build an FM-Index from a FASTA file.
     pub fn from_fasta(path: &str) -> Result<Self, SearchError> {
         use std::time::Instant;
@@ -367,18 +409,8 @@ impl FmIndexSearcher {
 
             let seq_up: Vec<u8> = seq.iter().map(|&b| b.to_ascii_uppercase()).collect();
 
-            // Strip version suffix (e.g., "NC_001133.9" → "NC_001133")
-            // to match GenBank accession format used by genome features.
-            let raw_id = record.id();
-            let name = match raw_id.rfind('.') {
-                Some(dot) if raw_id[dot + 1..].bytes().all(|b| b.is_ascii_digit()) => {
-                    raw_id[..dot].to_string()
-                }
-                _ => raw_id.to_string(),
-            };
-
             chroms.push(ChromInfo {
-                name,
+                name: record.id().to_string(),
                 start,
                 len: seq_up.len(),
             });
@@ -398,32 +430,7 @@ impl FmIndexSearcher {
         eprintln!("[fm_index] FASTA parse: {:.3}s ({} bp, {} chroms)",
             t_fasta.as_secs_f64(), text.len(), chroms.len());
 
-        let t1 = Instant::now();
-        let alphabet = Alphabet::new(b"$ACGTN");
-        let sa = suffix_array(&text);
-        let t_sa = t1.elapsed();
-        eprintln!("[fm_index] suffix_array (SA-IS): {:.3}s", t_sa.as_secs_f64());
-
-        let t2 = Instant::now();
-        let bwt_seq = bwt(&text, &sa);
-        let less_tbl = less(&bwt_seq, &alphabet);
-        let t_bwt = t2.elapsed();
-        eprintln!("[fm_index] BWT + less: {:.3}s", t_bwt.as_secs_f64());
-
-        let t3 = Instant::now();
-        let rank = BlockRank::from_bwt_and_less(&bwt_seq, &less_tbl);
-        let t_rank = t3.elapsed();
-        eprintln!("[fm_index] BlockRank: {:.3}s ({} blocks)",
-            t_rank.as_secs_f64(), rank.blocks.len());
-
-        eprintln!("[fm_index] total: {:.3}s", t0.elapsed().as_secs_f64());
-
-        Ok(FmIndexSearcher {
-            rank,
-            sa,
-            chroms,
-            text,
-        })
+        Self::from_text(text, chroms)
     }
 
     /// Flat interleaved rank data for persistence (reconstructed from blocks).

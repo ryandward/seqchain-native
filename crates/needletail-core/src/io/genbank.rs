@@ -44,11 +44,9 @@ pub fn load_genbank(path: &Path) -> Result<Genome, String> {
         } else {
             Topology::Linear
         };
-        genome.topologies.insert(chrom.clone(), topology);
 
-        // Sequence (uppercase)
-        let sequence: Vec<u8> = seq.seq.iter().map(|b| b.to_ascii_uppercase()).collect();
-        genome.sequences.push((chrom.clone(), sequence));
+        // Single-pass: uppercase + push into master buffer + sentinel
+        genome.push_sequence(chrom.clone(), &seq.seq, topology);
 
         // Features
         for feature in &seq.features {
@@ -304,24 +302,10 @@ pub fn load_fasta(path: &Path, circular_chroms: Option<&[&str]>) -> Result<Genom
     for record in reader.records() {
         let record = record
             .map_err(|e| format!("Failed to parse FASTA record: {}", e))?;
-        // Strip version suffix (e.g., "NC_001133.9" → "NC_001133")
-        let raw_id = record.id();
-        let chrom = match raw_id.rfind('.') {
-            Some(dot) if raw_id[dot + 1..].bytes().all(|b| b.is_ascii_digit()) => {
-                raw_id[..dot].to_string()
-            }
-            _ => raw_id.to_string(),
-        };
-        let seq: Vec<u8> = record.seq().iter().map(|b| b.to_ascii_uppercase()).collect();
+        let chrom = record.id().to_string();
 
         let is_circular = circular_chroms.map_or(false, |circs| {
-            circs.iter().any(|c| {
-                let stripped = match c.rfind('.') {
-                    Some(dot) if c[dot + 1..].bytes().all(|b| b.is_ascii_digit()) => &c[..dot],
-                    _ => c,
-                };
-                stripped == chrom
-            })
+            circs.iter().any(|&c| c == chrom)
         });
         let topology = if is_circular {
             Topology::Circular
@@ -329,8 +313,7 @@ pub fn load_fasta(path: &Path, circular_chroms: Option<&[&str]>) -> Result<Genom
             Topology::Linear
         };
 
-        genome.topologies.insert(chrom.clone(), topology);
-        genome.sequences.push((chrom, seq));
+        genome.push_sequence(chrom, record.seq(), topology);
     }
 
     Ok(genome)
@@ -354,9 +337,9 @@ mod tests {
             return;
         }
         let genome = load_fasta(&path, None).unwrap();
-        assert!(!genome.sequences.is_empty());
+        assert!(!genome.chromosomes.is_empty());
         assert!(genome.features.is_empty());
-        assert_eq!(genome.sequences.len(), 17);
+        assert_eq!(genome.chromosomes.len(), 17);
     }
 
     #[test]
@@ -366,8 +349,8 @@ mod tests {
             return;
         }
         let genome = load_fasta(&path, Some(&["NC_001422.1"])).unwrap();
-        assert_eq!(genome.sequences.len(), 1);
-        assert!(genome.is_circular(&genome.sequences[0].0));
+        assert_eq!(genome.chromosomes.len(), 1);
+        assert!(genome.is_circular(&genome.chromosomes[0].name));
     }
 
     #[test]
@@ -379,11 +362,11 @@ mod tests {
         let genome = load_genbank(&path).unwrap();
 
         // Two records: synth_chrom (circular) + synth_plasmid (linear)
-        assert_eq!(genome.sequences.len(), 2);
-        assert_eq!(genome.sequences[0].0, "synth_chrom");
-        assert_eq!(genome.sequences[1].0, "synth_plasmid");
-        assert_eq!(genome.sequences[0].1.len(), 100);
-        assert_eq!(genome.sequences[1].1.len(), 50);
+        assert_eq!(genome.chromosomes.len(), 2);
+        assert_eq!(genome.chromosomes[0].name, "synth_chrom");
+        assert_eq!(genome.chromosomes[1].name, "synth_plasmid");
+        assert_eq!(genome.chromosomes[0].len, 100);
+        assert_eq!(genome.chromosomes[1].len, 50);
 
         // Topology
         assert!(genome.is_circular("synth_chrom"));
@@ -450,7 +433,7 @@ mod tests {
             return;
         }
         let genome = load_genbank(&path).unwrap();
-        assert_eq!(genome.sequences.len(), 2);
+        assert_eq!(genome.chromosomes.len(), 2);
         assert_eq!(genome.features.len(), 5); // 4 genes + 1 CDS
     }
 }

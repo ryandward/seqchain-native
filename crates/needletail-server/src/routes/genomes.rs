@@ -11,7 +11,6 @@ use crate::AppState;
 #[derive(Deserialize)]
 pub struct UploadRequest {
     pub file_path: String,
-    pub fasta_path: Option<String>,
     pub index_path: Option<String>,
 }
 
@@ -19,10 +18,9 @@ pub async fn upload(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UploadRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let fasta = req.fasta_path.as_deref();
     let index = req.index_path.as_deref();
 
-    match state.genomes.upload(&req.file_path, fasta, index) {
+    match state.genomes.upload(&req.file_path, index) {
         Ok(id) => Ok(Json(json!({ "id": id }))),
         Err(e) => Err((
             StatusCode::BAD_REQUEST,

@@ -176,12 +176,16 @@ named `file`. The server:
 
 1. Writes the uploaded bytes to a temp file.
 2. Detects format by extension (`.gb`/`.gbk` → GenBank, `.fa`/`.fasta` → FASTA).
-3. For GenBank: parses genome, writes a temp FASTA, builds FM-Index from it.
-4. For FASTA: builds FM-Index directly.
-5. Returns `{"id": "uuid"}`.
+3. Parses the file into a `Genome` with a single contiguous master buffer
+   (`text: Vec<u8>`, sentinel-delimited, uppercase, FM-Index-ready).
+4. Moves the master buffer to `FmIndexSearcher::from_text()` which builds
+   SA, BWT, and BlockRank directly — no intermediate FASTA, no re-parsing.
+5. Builds seed tiers (K=10, K=14) via SA sweep.
+6. Returns `{"id": "uuid"}`.
 
-The genome, FM-Index, and seed tiers are held in memory. The temp files
-can be dropped after indexing completes.
+The genome text exists exactly once in memory (owned by `FmIndexSearcher`
+after the move). Features and chromosome metadata remain in the `Genome`
+struct. No temp FASTA files are generated.
 
 Body size limit: 512 MB (configurable via `DefaultBodyLimit` in `main.rs`).
 

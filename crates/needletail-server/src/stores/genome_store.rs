@@ -6,6 +6,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use uuid::Uuid;
 
+use needletail_core::engine::fm_index::ChromInfo;
 use needletail_core::io::genbank::{load_fasta, load_genbank};
 use needletail_core::models::genome::Genome;
 use needletail_core::{FmIndexSearcher, IndexHandle, SeedTier};
@@ -31,12 +32,12 @@ impl GenomeStore {
         }
     }
 
-    /// Upload a genome from a file path. Builds FM-Index from the genome's FASTA.
+    /// Upload a genome from a file path. Builds FM-Index directly from the
+    /// genome's master buffer (zero-copy for GenBank, single-pass for FASTA).
     /// Returns the genome ID.
     pub fn upload(
         &self,
         file_path: &str,
-        fasta_path: Option<&str>,
         index_path: Option<&str>,
     ) -> Result<String, String> {
         use std::time::Instant;
@@ -49,7 +50,7 @@ impl GenomeStore {
             .unwrap_or("");
 
         // Load genome
-        let genome = if ext == "gb" || file_path.ends_with(".gb.gz") {
+        let mut genome = if ext == "gb" || file_path.ends_with(".gb.gz") {
             load_genbank(path)?
         } else {
             load_fasta(path, None)?
@@ -70,21 +71,24 @@ impl GenomeStore {
             let tl = needletail_core::build_seed_tier_for_handle(&handle, text, idx_path, needletail_core::SEED_K_LARGE);
 
             (handle, ts, tl)
-        } else if let Some(fa_path) = fasta_path {
+        } else {
+            // Build FM-Index directly from genome's master buffer
             let t_idx = Instant::now();
-            let searcher = FmIndexSearcher::from_fasta(fa_path)
+            let chroms: Vec<ChromInfo> = genome.chromosomes.iter()
+                .map(|cm| ChromInfo { name: cm.name.clone(), start: cm.start, len: cm.len })
+                .collect();
+            let text = std::mem::take(&mut genome.text);
+            let searcher = FmIndexSearcher::from_text(text, chroms)
                 .map_err(|e| e.to_string())?;
             let searcher = Arc::new(searcher);
             eprintln!("[upload] FM-Index build: {:.3}s", t_idx.elapsed().as_secs_f64());
 
             let t_seed = Instant::now();
-            let (ts, tl) = needletail_core::build_seed_tiers(&*searcher, searcher.text(), fa_path)
+            let (ts, tl) = needletail_core::build_seed_tiers(&*searcher, searcher.text(), file_path)
                 .map_err(|e| e.to_string())?;
             eprintln!("[upload] seed tiers: {:.3}s", t_seed.elapsed().as_secs_f64());
 
             (IndexHandle::Built(searcher), Some(ts), Some(tl))
-        } else {
-            return Err("Either fasta_path or index_path must be provided".into());
         };
 
         eprintln!("[upload] total: {:.3}s", t0.elapsed().as_secs_f64());

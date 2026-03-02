@@ -158,7 +158,7 @@ impl JobManager {
             items_total: AtomicUsize::new(0),
         });
 
-        let chroms_total = genome.genome.sequences.len();
+        let chroms_total = genome.genome.chromosomes.len();
 
         let job = Arc::new(Job {
             id: job_id.clone(),

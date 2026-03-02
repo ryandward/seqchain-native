@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Single-pass master buffer architecture** — `Genome` struct replaced
+  `sequences: Vec<(String, Vec<u8>)>` with a single contiguous `text: Vec<u8>`
+  master buffer plus `chromosomes: Vec<ChromMeta>` metadata. Genome text now
+  exists exactly once in RAM (owned by `FmIndexSearcher` after move).
+  Eliminates the GenBank → temp FASTA → re-parse → FM-Index roundtrip that
+  kept the genome in memory 3×.
+- **`FmIndexSearcher::from_text()`** — new primary constructor takes ownership
+  of a pre-built master buffer. Builds SA, BWT, BlockRank directly with zero
+  file I/O, zero uppercasing, zero concatenation. `from_fasta()` kept for
+  standalone FASTA usage and PyO3 bindings; refactored to delegate to
+  `from_text()` internally.
+- **`Genome::push_sequence()`** — builder method appends a chromosome's
+  sequence directly into the master buffer (uppercase + sentinel) in a single
+  pass. Used by both `load_genbank()` and `load_fasta()`.
+- **Server upload path simplified** — `POST /api/files/upload` no longer
+  generates an intermediate FASTA file for GenBank uploads. Parses GenBank
+  once, moves the master buffer to `FmIndexSearcher::from_text()`. Removed
+  `fasta_path` parameter from `GenomeStore::upload()` and `UploadRequest`.
+- **Reverted accession version stripping** — the `.9` suffix hack in
+  `from_fasta()` and `load_fasta()` is removed. Chrom names now pass through
+  unchanged from the source file, matching GenBank accessions directly via the
+  shared `ChromMeta` objects.
+
 ## [0.2.0] - 2026-03-01
 
 ### Added

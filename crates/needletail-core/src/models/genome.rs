@@ -24,12 +24,28 @@ impl Topology {
     }
 }
 
-/// A genome: sequences, features, and metadata for one or more chromosomes.
+/// Metadata for a single chromosome in the master buffer.
+#[derive(Debug, Clone)]
+pub struct ChromMeta {
+    pub name: String,
+    /// Byte offset into `Genome.text` where this chromosome starts.
+    pub start: usize,
+    /// Sequence length (excluding the '$' sentinel).
+    pub len: usize,
+}
+
+/// A genome: master sequence buffer, features, and metadata for one or more chromosomes.
+///
+/// The `text` buffer contains all chromosome sequences concatenated with '$' sentinels:
+/// `chr1_bytes $ chr2_bytes $ ...` — uppercase, FM-Index-ready.
 #[derive(Debug, Clone)]
 pub struct Genome {
     pub name: String,
-    /// Chromosome name → DNA sequence (uppercase bytes). Insertion-ordered.
-    pub sequences: Vec<(String, Vec<u8>)>,
+    /// Master sequence buffer: chr1_bytes $ chr2_bytes $ ...
+    /// Uppercase, sentinel-delimited, FM-Index-ready.
+    pub text: Vec<u8>,
+    /// Chromosome metadata in parse order.
+    pub chromosomes: Vec<ChromMeta>,
     /// All features across all chromosomes.
     pub features: Vec<Region>,
     /// Chromosome name → topology.
@@ -40,31 +56,47 @@ impl Genome {
     pub fn new(name: impl Into<String>) -> Self {
         Genome {
             name: name.into(),
-            sequences: Vec::new(),
+            text: Vec::new(),
+            chromosomes: Vec::new(),
             features: Vec::new(),
             topologies: HashMap::new(),
         }
     }
 
+    /// Append a chromosome's sequence directly into the master buffer.
+    ///
+    /// Uppercases the sequence, appends a '$' sentinel, and records metadata.
+    pub fn push_sequence(&mut self, name: String, seq: &[u8], topology: Topology) {
+        let start = self.text.len();
+        self.text.reserve(seq.len() + 1);
+        for &b in seq {
+            self.text.push(b.to_ascii_uppercase());
+        }
+        let len = self.text.len() - start;
+        self.text.push(b'$');
+        self.chromosomes.push(ChromMeta { name: name.clone(), start, len });
+        self.topologies.insert(name, topology);
+    }
+
     /// Chromosome lengths in insertion order.
     pub fn chrom_lengths(&self) -> Vec<(&str, usize)> {
-        self.sequences
+        self.chromosomes
             .iter()
-            .map(|(name, seq)| (name.as_str(), seq.len()))
+            .map(|cm| (cm.name.as_str(), cm.len))
             .collect()
     }
 
     /// Chromosome lengths as a HashMap.
     pub fn chrom_length_map(&self) -> HashMap<&str, usize> {
-        self.sequences
+        self.chromosomes
             .iter()
-            .map(|(name, seq)| (name.as_str(), seq.len()))
+            .map(|cm| (cm.name.as_str(), cm.len))
             .collect()
     }
 
     /// Sorted list of chromosome names.
     pub fn chroms(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.sequences.iter().map(|(n, _)| n.as_str()).collect();
+        let mut names: Vec<&str> = self.chromosomes.iter().map(|cm| cm.name.as_str()).collect();
         names.sort();
         names
     }
@@ -94,20 +126,25 @@ impl Genome {
             .map_or(false, |t| t.is_circular())
     }
 
-    /// Get sequence for a chromosome.
+    /// Get sequence for a chromosome (slice into the master buffer).
     pub fn sequence(&self, chrom: &str) -> Option<&[u8]> {
-        self.sequences
+        self.chromosomes
             .iter()
-            .find(|(n, _)| n == chrom)
-            .map(|(_, s)| s.as_slice())
+            .find(|cm| cm.name == chrom)
+            .map(|cm| &self.text[cm.start..cm.start + cm.len])
     }
 
     /// Boolean topology vector in insertion order (for compatibility with engine).
     pub fn topology_vec(&self) -> Vec<bool> {
-        self.sequences
+        self.chromosomes
             .iter()
-            .map(|(name, _)| self.is_circular(name))
+            .map(|cm| self.is_circular(&cm.name))
             .collect()
+    }
+
+    /// Number of chromosomes.
+    pub fn chrom_count(&self) -> usize {
+        self.chromosomes.len()
     }
 }
 
@@ -119,21 +156,25 @@ mod tests {
     #[test]
     fn test_genome_basics() {
         let mut g = Genome::new("test");
-        g.sequences.push(("chr1".into(), b"ATCGATCG".to_vec()));
-        g.sequences.push(("chr2".into(), b"GGCC".to_vec()));
-        g.topologies.insert("chr1".into(), Topology::Linear);
-        g.topologies.insert("chr2".into(), Topology::Circular);
+        g.push_sequence("chr1".into(), b"ATCGATCG", Topology::Linear);
+        g.push_sequence("chr2".into(), b"GGCC", Topology::Circular);
 
         assert_eq!(g.chrom_lengths(), vec![("chr1", 8), ("chr2", 4)]);
         assert!(!g.is_circular("chr1"));
         assert!(g.is_circular("chr2"));
         assert_eq!(g.sequence("chr1"), Some(b"ATCGATCG".as_slice()));
+        assert_eq!(g.sequence("chr2"), Some(b"GGCC".as_slice()));
+        assert_eq!(g.chrom_count(), 2);
+
+        // Master buffer: ATCGATCG$GGCC$
+        assert_eq!(g.text.len(), 8 + 1 + 4 + 1);
+        assert_eq!(&g.text[..9], b"ATCGATCG$");
     }
 
     #[test]
     fn test_genome_genes() {
         let mut g = Genome::new("test");
-        g.sequences.push(("chr1".into(), b"ATCGATCG".to_vec()));
+        g.push_sequence("chr1".into(), b"ATCGATCG", Topology::Linear);
         g.features.push(
             Region::new("chr1", 0, 100)
                 .with_strand(Strand::Forward)
@@ -148,5 +189,12 @@ mod tests {
         let genes = g.genes();
         assert_eq!(genes.len(), 1);
         assert_eq!(genes[0].start, 0);
+    }
+
+    #[test]
+    fn test_push_sequence_uppercases() {
+        let mut g = Genome::new("test");
+        g.push_sequence("chr1".into(), b"acgtACGT", Topology::Linear);
+        assert_eq!(g.sequence("chr1"), Some(b"ACGTACGT".as_slice()));
     }
 }

@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use needletail_core::engine::fm_index::ChromInfo;
 use needletail_core::io::genbank::load_genbank;
 use needletail_core::io::json::region_to_json;
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
@@ -11,32 +12,22 @@ fn main() {
         .unwrap_or_else(|| "test/fixtures/zymomonas.gb".to_string());
 
     let t0 = std::time::Instant::now();
-    let genome = load_genbank(Path::new(&gb_path)).unwrap();
+    let mut genome = load_genbank(Path::new(&gb_path)).unwrap();
     eprintln!("Loaded genome: {} chroms, {} genes ({:.2?})",
-        genome.sequences.len(), genome.genes().len(), t0.elapsed());
+        genome.chromosomes.len(), genome.genes().len(), t0.elapsed());
 
-    // Build FM-index from the genome sequences in memory
-    // Write a temp FASTA for the FM-index builder
-    let stem = Path::new(&gb_path).file_stem().unwrap().to_string_lossy();
-    let tmp_fa_owned = format!("/tmp/{}_needletail.fa", stem);
-    let tmp_fa = tmp_fa_owned.as_str();
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(tmp_fa).unwrap();
-        for (name, seq) in &genome.sequences {
-            writeln!(f, ">{}", name).unwrap();
-            f.write_all(seq).unwrap();
-            writeln!(f).unwrap();
-        }
-    }
-
+    // Build FM-index directly from the genome's master buffer (zero-copy move)
     let t0 = std::time::Instant::now();
-    let searcher = FmIndexSearcher::from_fasta(tmp_fa).unwrap();
+    let chroms: Vec<ChromInfo> = genome.chromosomes.iter()
+        .map(|cm| ChromInfo { name: cm.name.clone(), start: cm.start, len: cm.len })
+        .collect();
+    let text = std::mem::take(&mut genome.text);
+    let searcher = FmIndexSearcher::from_text(text, chroms).unwrap();
     let searcher = Arc::new(searcher);
     eprintln!("Built FM-index ({:.2?})", t0.elapsed());
 
     let t0 = std::time::Instant::now();
-    let (ts, tl) = build_seed_tiers(&*searcher, searcher.text(), tmp_fa).unwrap();
+    let (ts, tl) = build_seed_tiers(&*searcher, searcher.text(), &gb_path).unwrap();
     eprintln!("Warmed seeds ({:.2?})", t0.elapsed());
 
     let handle = IndexHandle::Built(searcher);
