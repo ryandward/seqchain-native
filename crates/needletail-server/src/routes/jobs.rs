@@ -107,7 +107,7 @@ pub async fn stream(
         ));
     }
 
-    // Take the result path — file on disk written by FileSink.
+    // Take the result path — file on disk written by ParquetFileSink.
     let result_path = job.result_path.lock().unwrap().take();
     let taken_result = job.result.lock().unwrap().take();
 
@@ -140,7 +140,7 @@ pub async fn stream(
             let mut response = Response::new(body);
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
+                HeaderValue::from_static("application/vnd.apache.parquet"),
             );
             Ok(response)
         }

@@ -35,6 +35,7 @@ pub use error::SearchError;
 pub use io::persist::MappedIndex;
 pub use io::{RegionSink, CountingSink};
 pub use io::json::FileSink;
+pub use io::parquet_file_sink::ParquetFileSink;
 pub use operations::pam_scanner::{
     enrich_hits, filter_hits_by_pam, find_pam_sites, GuideHits,
 };

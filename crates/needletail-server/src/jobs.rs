@@ -35,7 +35,7 @@ fn compute_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-use needletail_core::io::json::FileSink;
+use needletail_core::io::parquet_file_sink::ParquetFileSink;
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
 use needletail_core::pipeline::design::{self, LibraryResult, ProgressSink};
 
@@ -125,8 +125,8 @@ pub struct Job {
     pub status: std::sync::Mutex<JobStatus>,
     pub progress: Arc<JobProgress>,
     pub result: std::sync::Mutex<Option<Result<LibraryResult, String>>>,
-    /// Path to the JSONL result file on disk.  The pipeline drains guides
-    /// directly to this file via FileSink — zero RAM accumulation.
+    /// Path to the Parquet result file on disk.  The pipeline drains guides
+    /// directly to this file via ParquetFileSink — zero RAM accumulation.
     pub result_path: std::sync::Mutex<Option<PathBuf>>,
     pub error: std::sync::Mutex<Option<String>>,
     pub guides_complete: AtomicUsize,
@@ -222,9 +222,9 @@ impl JobManager {
             // Create results directory and FileSink.
             let results_dir = PathBuf::from("/tmp/needletail-results");
             std::fs::create_dir_all(&results_dir).ok();
-            let file_path = results_dir.join(format!("{}.json", jid));
+            let file_path = results_dir.join(format!("{}.parquet", jid));
 
-            let sink_result = FileSink::create(&file_path)
+            let sink_result = ParquetFileSink::create(&file_path)
                 .map_err(|e| format!("failed to create result file: {}", e));
 
             let result = match sink_result {
@@ -245,7 +245,7 @@ impl JobManager {
                         )
                     });
 
-                    // Finish the file (write closing `]`) on success
+                    // Finish the Parquet file (flush remaining rows + close writer)
                     match pipeline_result {
                         Ok(lib) => {
                             match sink.finish() {

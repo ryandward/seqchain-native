@@ -9,6 +9,7 @@
 
 pub mod genbank;
 pub mod json;
+pub mod parquet_file_sink;
 pub mod parquet_sink;
 pub mod persist;
 
