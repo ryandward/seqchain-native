@@ -65,10 +65,12 @@ pub fn annotate_locus_in_place(
 
     let rel_pos = relative_position(region.start, feat.start, feat.end, cl);
 
-    region.tags.insert(
-        "feature_name".into(),
-        TagValue::Str(feat.name.clone()),
-    );
+    if !feat.name.is_empty() {
+        region.tags.insert(
+            "feature_name".into(),
+            TagValue::Str(feat.name.clone()),
+        );
+    }
     if let Some(ft) = feat.tags.get("feature_type") {
         region.tags.insert("feature_type".into(), ft.clone());
     }
