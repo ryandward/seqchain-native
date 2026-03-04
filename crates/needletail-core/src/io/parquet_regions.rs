@@ -6,8 +6,7 @@
 //! Schema is discovered dynamically from the first row group: the fixed
 //! Region fields (chrom, start, end, strand, score) are always present,
 //! and every tag seen across the buffered regions becomes a nullable column.
-//! Columns are ordered by `TAG_ORDER` first, then alphabetically for any
-//! novel tags.
+//! Columns are ordered alphabetically — the schema carries no biological opinion.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -21,7 +20,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::models::region::{Region, TagValue};
-use super::{RegionSink, HIDDEN_TAGS, TAG_ORDER};
+use super::{RegionSink, HIDDEN_TAGS};
 
 const ROW_GROUP_SIZE: usize = 100_000;
 
@@ -160,16 +159,10 @@ impl ParquetFileSink {
             }
         }
 
-        // Order: TAG_ORDER tags first (if present), then remaining sorted.
-        let mut ordered: Vec<(String, ColType)> = Vec::with_capacity(seen.len());
-        for &name in TAG_ORDER {
-            if let Some(ct) = seen.remove(name) {
-                ordered.push((name.to_string(), ct));
-            }
-        }
-        let mut extras: Vec<(String, ColType)> = seen.into_iter().collect();
-        extras.sort_by(|a, b| a.0.cmp(&b.0));
-        ordered.extend(extras);
+        // Order: alphabetical. The schema carries no biological opinion.
+        // Column ordering for human consumption belongs in downstream tooling.
+        let mut ordered: Vec<(String, ColType)> = seen.into_iter().collect();
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Build Arrow schema: 5 fixed fields + N tag columns.
         let mut fields = vec![
@@ -366,14 +359,14 @@ mod tests {
         assert_eq!(schema.field(3).name(), "strand");
         assert_eq!(schema.field(4).name(), "score");
 
-        // Dynamic tag columns discovered — TAG_ORDER tags first
+        // Dynamic tag columns discovered — pure alphabetical order
         let tag_names: Vec<&str> = (5..schema.fields().len())
             .map(|i| schema.field(i).name().as_str())
             .collect();
-        // guide_id should come before feature_type per TAG_ORDER
-        let gid_pos = tag_names.iter().position(|&n| n == "guide_id").unwrap();
+        // Alphabetically: feature_name < feature_type < guide_id < off_targets < spacer < total_hits
         let ft_pos  = tag_names.iter().position(|&n| n == "feature_type").unwrap();
-        assert!(gid_pos < ft_pos);
+        let gid_pos = tag_names.iter().position(|&n| n == "guide_id").unwrap();
+        assert!(ft_pos < gid_pos, "alphabetical: feature_type before guide_id");
 
         // Verify values
         let chrom_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -480,14 +473,12 @@ mod tests {
         let cl = schema.field_with_name("custom_label").unwrap();
         assert_eq!(cl.data_type(), &DataType::Utf8);
 
-        // guide_id (TAG_ORDER) should come before gc_content/custom_label
+        // Pure alphabetical: custom_label < gc_content < guide_id
         let gid_idx = schema.index_of("guide_id").unwrap();
         let gc_idx  = schema.index_of("gc_content").unwrap();
         let cl_idx  = schema.index_of("custom_label").unwrap();
-        assert!(gid_idx < gc_idx);
-        assert!(gid_idx < cl_idx);
-        // Extras are alphabetical: custom_label < gc_content
-        assert!(cl_idx < gc_idx);
+        assert!(cl_idx < gc_idx,  "alphabetical: custom_label before gc_content");
+        assert!(gc_idx < gid_idx, "alphabetical: gc_content before guide_id");
     }
 
     #[test]

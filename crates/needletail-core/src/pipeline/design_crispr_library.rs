@@ -288,6 +288,16 @@ pub fn design_crispr_library(
 
     let chrom_len_map = genome.chrom_length_map();
 
+    // Build feature_type → distance_label map from the preset.
+    // The Glass reads its opinion from the YAML; the Stone never sees it.
+    let dist_label_map: std::collections::HashMap<&str, &str> = feature_config
+        .features
+        .iter()
+        .filter_map(|f| {
+            f.distance_label.as_deref().map(|label| (f.name.as_str(), label))
+        })
+        .collect();
+
     // Lazy Region iterator — the Vec<Region> never exists.
     // guide_hits, hit_counts, guide_spacer_map, chrom_names are moved into
     // the closure and consumed one guide at a time.
@@ -310,7 +320,7 @@ pub fn design_crispr_library(
     let mut last_progress_report = std::time::Instant::now();
     progress.set_items(0, total_guides_scored);
     for mut region in annotator {
-        // Compute TSS distance for regions that have a landmark
+        // Compute landmark distance and label it per the tiling preset.
         if let (Some(landmark), Some(feat_strand)) = (
             region.tags.get("landmark").and_then(|v| v.as_i64()),
             region
@@ -321,9 +331,13 @@ pub fn design_crispr_library(
         ) {
             let fwd = feat_strand == "+";
             let dist = signed_distance(region.start, landmark, fwd);
-            region
+            let label = region
                 .tags
-                .insert("signed_distance".into(), TagValue::Int(dist));
+                .get("feature_type")
+                .and_then(|v| v.as_str())
+                .and_then(|ft| dist_label_map.get(ft).copied())
+                .unwrap_or("signed_distance");
+            region.tags.insert(label.into(), TagValue::Int(dist));
         }
 
         sink.consume(region).map_err(|e| format!("sink error: {}", e))?;
@@ -377,20 +391,18 @@ fn build_guide_region(
     let guide_seq = std::str::from_utf8(&guide_hits.guide_seqs[i * gl..(i + 1) * gl]).unwrap_or("").to_string();
     let guide_id  = std::str::from_utf8(&guide_hits.guide_ids [i * 8..(i + 1) *  8]).unwrap_or("").to_string();
 
-    let spacer_idx = guide_spacer_map[i];
-    let total_hits = hit_counts.get(spacer_idx).copied().unwrap_or(0);
+    let spacer_idx  = guide_spacer_map[i];
+    let total_hits  = hit_counts.get(spacer_idx).copied().unwrap_or(0);
     let off_targets = if total_hits > 0 { total_hits - 1 } else { 0 };
 
     Region::new(&chrom_names[cid], gs, ge)
         .with_strand(strand)
         .with_name(&guide_id)
-        .with_score(off_targets as f64)
-        .with_tag("spacer",     spacer)
-        .with_tag("pam_seq",    pam_seq)
-        .with_tag("guide_seq",  guide_seq)
-        .with_tag("guide_id",   guide_id)
+        .with_tag("spacer",      spacer)
+        .with_tag("pam_seq",     pam_seq)
         .with_tag("off_targets", off_targets as i64)
-        .with_tag("total_hits",  total_hits  as i64)
+        .with_tag("guide_id",    guide_id)
+        .with_tag("guide_seq",   guide_seq)
 }
 
 /// Score unique spacers: search + PAM filter → hit counts per spacer.

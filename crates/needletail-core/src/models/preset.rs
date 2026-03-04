@@ -117,6 +117,10 @@ pub struct FeatureDefinition {
     pub max_distance: i64,
     pub priority: i32,
     pub anchor: Anchor,
+    /// Semantic label for the signed_distance column in output files.
+    /// e.g. "distance_to_tss" for promoters, "distance_to_tes" for terminators.
+    /// Falls back to "signed_distance" if absent.
+    pub distance_label: Option<String>,
 }
 
 /// Configuration for feature-type annotation.
@@ -135,6 +139,10 @@ struct FeatureDefYaml {
     priority: i32,
     #[serde(default)]
     anchor: String,
+    /// Downstream semantic label for the signed_distance column.
+    /// Defined in the tiling YAML; absent features default to "signed_distance".
+    #[serde(default)]
+    distance_label: Option<String>,
 }
 
 /// Raw YAML shape for feature configs.
@@ -158,6 +166,7 @@ impl From<FeatureYaml> for FeatureConfig {
                 max_distance: def.max_distance,
                 priority: def.priority,
                 anchor: Anchor::from_str_anchor(&def.anchor),
+                distance_label: def.distance_label,
             })
             .collect();
 

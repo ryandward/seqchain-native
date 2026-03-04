@@ -23,20 +23,6 @@ use crate::models::region::Region;
 /// here — this is the single source of truth.
 pub const HIDDEN_TAGS: &[&str] = &["landmark", "gene_strand"];
 
-/// Canonical ordering for tag columns in output files.
-///
-/// Tags listed here appear in this sequence after the fixed Region fields
-/// (chrom, start, end, strand, score).  Any tags NOT listed here follow
-/// in alphabetical order.  This keeps output stable across pipeline
-/// versions while remaining open to new tags without code changes.
-pub const TAG_ORDER: &[&str] = &[
-    "guide_id", "guide_seq", "spacer", "pam_seq",
-    "off_targets", "total_hits",
-    "feature_type", "feature_name", "feature_strand",
-    "feature_start", "feature_end",
-    "signed_distance", "relative_pos", "offset", "overlap",
-];
-
 /// Terminal sink that consumes annotated Regions one at a time.
 ///
 /// This is the I/O boundary: the pipeline transfers ownership of each

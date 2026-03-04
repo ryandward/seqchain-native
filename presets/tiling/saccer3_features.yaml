@@ -16,17 +16,20 @@ features:
     relation: overlap
     priority: 1
     anchor: five_prime
+    distance_label: offset_from_start
 
   promoter:
     relation: upstream
     max_distance: 500
     priority: 2
     anchor: five_prime
+    distance_label: distance_to_tss
 
   terminator:
     relation: downstream
     max_distance: 200
     priority: 3
     anchor: three_prime
+    distance_label: distance_to_tes
 
 priority: [gene_body, promoter, terminator]

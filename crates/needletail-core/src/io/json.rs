@@ -14,57 +14,28 @@ use serde_json::{json, Map, Value};
 
 use crate::models::region::{Region, TagValue};
 use super::{RegionSink, HIDDEN_TAGS};
-#[cfg(test)]
-use super::TAG_ORDER;
 
-// Full field order for JSON output: fixed Region fields interleaved with
-// TAG_ORDER so that `score` appears after guide identity and before
-// off-target quality, matching the user's semantic grouping.
-//
-// The tag entries here must stay consistent with TAG_ORDER in io/mod.rs —
-// the `test_field_order_covers_tag_order` test enforces this.
-const FIELD_ORDER: &[&str] = &[
-    // position (fixed)
-    "chrom", "start", "end", "strand",
-    // guide identity (from TAG_ORDER)
-    "guide_id", "guide_seq", "spacer", "pam_seq",
-    // off-target quality (score is fixed; off_targets/total_hits from TAG_ORDER)
-    "score", "off_targets", "total_hits",
-    // feature context (from TAG_ORDER)
-    "feature_type", "feature_name", "feature_strand",
-    "feature_start", "feature_end",
-    // positional within feature (from TAG_ORDER)
-    "signed_distance", "relative_pos", "offset", "overlap",
-];
-
-/// Convert a Region to a JSON value with fields in semantic order.
+/// Convert a Region to a JSON value.
+///
+/// Fixed fields (chrom, start, end, strand, score) come first, then all
+/// tags sorted alphabetically.  Internal tags (HIDDEN_TAGS) are excluded.
+/// The Stone has no opinion on biological column ordering.
 pub fn region_to_json(r: &Region) -> Value {
     let mut obj = Map::new();
 
-    // Collect all tag values, excluding internal fields.
-    let mut tags: std::collections::HashMap<&str, Value> = r.tags
+    obj.insert("chrom".into(),  json!(r.chrom));
+    obj.insert("start".into(),  json!(r.start));
+    obj.insert("end".into(),    json!(r.end));
+    obj.insert("strand".into(), json!(r.strand.as_str()));
+    obj.insert("score".into(),  sanitize_float(r.score));
+
+    let mut tags: Vec<(&str, Value)> = r.tags
         .iter()
         .filter(|(k, _)| !HIDDEN_TAGS.contains(&k.as_str()))
         .map(|(k, v)| (k.as_str(), tag_value_to_json(v)))
         .collect();
+    tags.sort_by_key(|(k, _)| *k);
 
-    // Seed with the fixed Region fields so they participate in ordering.
-    let fixed: std::collections::HashMap<&str, Value> = [
-        ("chrom",  json!(r.chrom)),
-        ("start",  json!(r.start)),
-        ("end",    json!(r.end)),
-        ("strand", json!(r.strand.as_str())),
-        ("score",  sanitize_float(r.score)),
-    ].into();
-
-    // Emit in canonical order, drawing from fixed fields first, then tags.
-    for &field in FIELD_ORDER {
-        if let Some(v) = fixed.get(field).cloned().or_else(|| tags.remove(field)) {
-            obj.insert(field.into(), v);
-        }
-    }
-
-    // Any remaining tags not in FIELD_ORDER come last.
     for (k, v) in tags {
         obj.insert(k.into(), v);
     }
@@ -217,19 +188,6 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["chrom"], "chr1");
         assert_eq!(parsed[1]["chrom"], "chr1");
-    }
-
-    #[test]
-    fn test_field_order_covers_tag_order() {
-        // Every entry in TAG_ORDER must appear in FIELD_ORDER.
-        // This catches drift between the shared constant and the JSON-specific ordering.
-        for &tag in TAG_ORDER {
-            assert!(
-                FIELD_ORDER.contains(&tag),
-                "TAG_ORDER entry '{}' missing from FIELD_ORDER — add it to json.rs",
-                tag,
-            );
-        }
     }
 
     #[test]
