@@ -41,7 +41,24 @@ impl GenomeStore {
         index_path: Option<&str>,
     ) -> Result<String, String> {
         use std::time::Instant;
+
+        fn rss_mb() -> f64 {
+            std::fs::read_to_string("/proc/self/status").ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<f64>().ok()))
+                .unwrap_or(0.0) / 1024.0
+        }
+        fn peak_mb() -> f64 {
+            std::fs::read_to_string("/proc/self/status").ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<f64>().ok()))
+                .unwrap_or(0.0) / 1024.0
+        }
+
         let t0 = Instant::now();
+        eprintln!("[mem] upload start: RSS={:.0}MB peak={:.0}MB", rss_mb(), peak_mb());
 
         let path = Path::new(file_path);
         let ext = path
@@ -61,7 +78,7 @@ impl GenomeStore {
             return Err(format!("Unrecognized file extension: .{ext}"));
         };
         let t_parse = t0.elapsed();
-        eprintln!("[upload] genome parse: {:.3}s", t_parse.as_secs_f64());
+        eprintln!("[upload] genome parse: {:.3}s  RSS={:.0}MB peak={:.0}MB", t_parse.as_secs_f64(), rss_mb(), peak_mb());
 
         // Build or load FM-Index
         let (index, tier_small, tier_large) = if let Some(idx_path) = index_path {
@@ -86,21 +103,21 @@ impl GenomeStore {
             let searcher = FmIndexSearcher::from_text(text, chroms)
                 .map_err(|e| e.to_string())?;
             let searcher = Arc::new(searcher);
-            eprintln!("[upload] FM-Index build: {:.3}s", t_idx.elapsed().as_secs_f64());
+            eprintln!("[upload] FM-Index build: {:.3}s  RSS={:.0}MB peak={:.0}MB", t_idx.elapsed().as_secs_f64(), rss_mb(), peak_mb());
 
             let t_seed = Instant::now();
             let ts = needletail_core::build_seed_tier_for_handle(
                 &IndexHandle::Built(searcher.clone()), searcher.text(), file_path,
                 needletail_core::SEED_K_SMALL,
             );
-            eprintln!("[upload] seed tier K={}: {:.3}s", needletail_core::SEED_K_SMALL, t_seed.elapsed().as_secs_f64());
+            eprintln!("[upload] seed tier K={}: {:.3}s  RSS={:.0}MB peak={:.0}MB", needletail_core::SEED_K_SMALL, t_seed.elapsed().as_secs_f64(), rss_mb(), peak_mb());
 
             // K=14 tier skipped: only 8% faster scoring but +293 MB RAM.
             // mm=3 falls back to K=10 seeding automatically.
             (IndexHandle::Built(searcher), ts, None)
         };
 
-        eprintln!("[upload] total: {:.3}s", t0.elapsed().as_secs_f64());
+        eprintln!("[upload] total: {:.3}s  RSS={:.0}MB peak={:.0}MB", t0.elapsed().as_secs_f64(), rss_mb(), peak_mb());
         let id = Uuid::new_v4().to_string();
         let stored = Arc::new(StoredGenome {
             id: id.clone(),

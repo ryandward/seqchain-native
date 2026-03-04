@@ -7,11 +7,13 @@
 //!
 //! Import hierarchy: `engine`, `error` (never chemistry, operations, or lib).
 
+pub mod fastq;
 pub mod genbank;
 pub mod json;
 pub mod parquet_hits;
 pub mod parquet_regions;
 pub mod persist;
+pub mod sam;
 
 use crate::models::region::Region;
 

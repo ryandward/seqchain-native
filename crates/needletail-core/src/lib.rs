@@ -36,6 +36,10 @@ pub use io::persist::MappedIndex;
 pub use io::{RegionSink, CountingSink};
 pub use io::json::FileSink;
 pub use io::parquet_regions::ParquetFileSink;
+pub use io::fastq::{ChunkedFastq, FastqRecord};
+pub use io::sam::{SamSink, score_to_mapq};
+pub use engine::affine::{extend_batch, pivot_reads, SpliceParams};
+pub use pipeline::align::{align_fastq, AlignConfig, AlignError, AlignStats};
 pub use operations::pam_scanner::{
     enrich_hits, filter_hits_by_pam, find_pam_sites, GuideHits,
 };

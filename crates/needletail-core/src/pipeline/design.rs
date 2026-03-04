@@ -20,7 +20,7 @@ use crate::io::RegionSink;
 use crate::models::genome::Genome;
 use crate::models::preset::{CRISPRPreset, FeatureConfig};
 use crate::models::region::{Region, Strand, TagValue};
-use crate::operations::pam_scanner::{enrich_hits, find_pam_sites};
+use crate::operations::pam_scanner::{enrich_hits, find_pam_sites, GuideHits};
 use crate::{
     filter_hits_by_pam, prepare_queries, run_search_seeded, run_search_unseeded,
     select_tier, IndexHandle, SeedTier,
@@ -160,7 +160,10 @@ pub fn design_library(
     let guide_hits = enrich_hits(pam_hits, &chrom_names, direction, topo_ref, &chrom_ranges);
     eprintln!("[mem] after enrich ({} guides): RSS={:.0}MB peak={:.0}MB", guide_hits.count, rss_mb(), peak_mb());
 
-    // ── Step: scoring ───────────────────────────────────────────────────────
+    // ── Step: scoring (O(C) chunked — the New Stone) ─────────────────────────
+    // Each chunk of SCORE_CHUNK unique spacers is searched independently.
+    // The BWT frontier peak is bounded by chunk_size × frontier_bytes rather
+    // than N_unique × frontier_bytes — the same O(C) invariant as align_fastq.
     progress.set_step("scoring");
     progress.set_stage("Scoring off-targets");
     progress.clear_items();
@@ -169,8 +172,10 @@ pub fn design_library(
         return Err("cancelled".into());
     }
 
-    // Collect unique spacers for deduplication
+    // Collect unique spacers for deduplication (O(N_unique) strings, ~50 MB)
     let sl = guide_hits.spacer_len;
+    let pl = guide_hits.pam_len;
+    let gl = sl + pl;
     let n_guides = guide_hits.count;
 
     let mut unique_spacers: Vec<String> = Vec::new();
@@ -194,99 +199,73 @@ pub fn design_library(
         guide_spacer_map.push(spacer_idx);
     }
 
-    // Search all unique spacers
+    // ── Chunked BWT search: O(C) frontier peak per cycle ─────────────────────
+    // Scores SCORE_CHUNK spacers at a time. Each chunk feeds the AVX2 BWT
+    // automaton independently; the search frontier never materialises more than
+    // chunk_size × avg_hits simultaneously. This applies the tensor pivot
+    // principle at the BWT level: C reads feed the 256-wide SIMD automaton
+    // per cycle, keeping peak RAM independent of N_unique.
     let n_unique = unique_spacers.len();
-    progress.set_items(0, n_unique);
-    progress.set_stage(&format!("Aligning {} unique spacers", n_unique));
+    const SCORE_CHUNK: usize = 100_000;
+    let n_chunks = (n_unique + SCORE_CHUNK - 1) / SCORE_CHUNK;
+    let mut hit_counts = vec![0u64; n_unique];
+
     let t_score = std::time::Instant::now();
-    let hit_counts = if !unique_spacers.is_empty() {
-        score_spacers(
-            &unique_spacers,
-            index,
-            tier_small,
-            tier_large,
-            &preset.pam,
-            direction,
-            preset.mismatches,
-            topo_ref,
-        )?
-    } else {
-        vec![]
-    };
+    progress.set_items(0, n_unique);
+    progress.set_stage(&format!(
+        "Aligning {} unique spacers ({} chunks of {})",
+        n_unique, n_chunks, SCORE_CHUNK
+    ));
+
+    for chunk_start in (0..n_unique).step_by(SCORE_CHUNK) {
+        let chunk_end = (chunk_start + SCORE_CHUNK).min(n_unique);
+        let chunk_slice = &unique_spacers[chunk_start..chunk_end];
+        if !chunk_slice.is_empty() {
+            let chunk_counts = score_spacers(
+                chunk_slice,
+                index,
+                tier_small,
+                tier_large,
+                &preset.pam,
+                direction,
+                preset.mismatches,
+                topo_ref,
+            )?;
+            hit_counts[chunk_start..chunk_end].copy_from_slice(&chunk_counts);
+        }
+        progress.set_items(chunk_end, n_unique);
+        eprintln!(
+            "[mem] scoring chunk {}/{}: RSS={:.0}MB peak={:.0}MB",
+            chunk_end, n_unique, rss_mb(), peak_mb()
+        );
+        if progress.is_cancelled() {
+            return Err("cancelled".into());
+        }
+    }
+
+    eprintln!(
+        "[pipeline] score_spacers: {:.3}s ({} unique, mm={}, {} chunk(s))",
+        t_score.elapsed().as_secs_f64(), n_unique, preset.mismatches, n_chunks
+    );
     progress.set_items(n_unique, n_unique);
-    eprintln!("[pipeline] score_spacers: {:.3}s ({} unique, mm={})",
-        t_score.elapsed().as_secs_f64(), n_unique, preset.mismatches);
 
     // Drop dedup structures — no longer needed
     drop(unique_spacers);
     drop(spacer_to_idx);
     eprintln!("[mem] after scoring: RSS={:.0}MB peak={:.0}MB", rss_mb(), peak_mb());
 
-    // ── Build scored guide Regions ────────────────────────────────────────────
-    progress.set_stage("Building scored regions");
-    progress.set_items(0, n_guides);
-    progress.report("annotating", 5, 7);
-    if progress.is_cancelled() {
-        return Err("cancelled".into());
-    }
+    // ── Sort index into guide_hits — O(N×8 bytes) not O(N×Region) ────────────
+    // guide_hits SoA (from enrich_hits) interleaves forward and reverse strand
+    // hits. Sort a Vec<usize> of indices rather than materialising a Vec<Region>.
+    // For 944K guides: ~7.5 MB of indices vs ~647 MB of Region objects.
+    let mut order: Vec<usize> = (0..n_guides).collect();
+    order.sort_unstable_by_key(|&i| (guide_hits.chrom_ids[i], guide_hits.guide_starts[i]));
 
-    let pl = guide_hits.pam_len;
-    let gl = sl + pl;
-    let report_interval = (n_guides / 100).max(1000);
-
-    let mut scored_guides: Vec<Region> = Vec::with_capacity(n_guides);
-    for i in 0..n_guides {
-        let cid = guide_hits.chrom_ids[i] as usize;
-        let chrom_name = &chrom_names[cid];
-        let gs = guide_hits.guide_starts[i] as i64;
-        let ge = guide_hits.guide_ends[i] as i64;
-        let strand = if guide_hits.strands[i] > 0 {
-            Strand::Forward
-        } else {
-            Strand::Reverse
-        };
-
-        let spacer = std::str::from_utf8(&guide_hits.spacers[i * sl..(i + 1) * sl])
-            .unwrap_or("")
-            .to_string();
-        let pam_seq = std::str::from_utf8(&guide_hits.pam_seqs[i * pl..(i + 1) * pl])
-            .unwrap_or("")
-            .to_string();
-        let guide_seq = std::str::from_utf8(&guide_hits.guide_seqs[i * gl..(i + 1) * gl])
-            .unwrap_or("")
-            .to_string();
-        let guide_id = std::str::from_utf8(&guide_hits.guide_ids[i * 8..(i + 1) * 8])
-            .unwrap_or("")
-            .to_string();
-
-        let spacer_idx = guide_spacer_map[i];
-        let total_hits = hit_counts.get(spacer_idx).copied().unwrap_or(0);
-        let off_targets = if total_hits > 0 { total_hits - 1 } else { 0 };
-
-        let r = Region::new(chrom_name, gs, ge)
-            .with_strand(strand)
-            .with_name(&guide_id)
-            .with_score(off_targets as f64)
-            .with_tag("spacer", spacer)
-            .with_tag("pam_seq", pam_seq)
-            .with_tag("guide_seq", guide_seq)
-            .with_tag("guide_id", guide_id)
-            .with_tag("off_targets", off_targets as i64)
-            .with_tag("total_hits", total_hits as i64);
-
-        scored_guides.push(r);
-
-        if (i + 1) % report_interval == 0 {
-            progress.set_items(i + 1, n_guides);
-        }
-    }
-    progress.set_items(n_guides, n_guides);
-
-    let total_guides_scored = scored_guides.len();
-    eprintln!("[mem] after {} guide regions: RSS={:.0}MB peak={:.0}MB", total_guides_scored, rss_mb(), peak_mb());
-
-    // Sort guides by (chrom, start) for sweep-line
-    scored_guides.sort_by(|a, b| a.chrom.cmp(&b.chrom).then(a.start.cmp(&b.start)));
+    let total_guides_scored = n_guides;
+    eprintln!(
+        "[mem] after index sort ({} guides): RSS={:.0}MB peak={:.0}MB",
+        total_guides_scored, rss_mb(), peak_mb()
+    );
 
     // ── Sweep-line annotation → terminal drain (O(k) auxiliary RAM) ──────────
     progress.set_step("annotation");
@@ -299,19 +278,24 @@ pub fn design_library(
 
     let chrom_len_map = genome.chrom_length_map();
 
-    // Ownership of scored_guides is transferred via into_iter().
-    // The Vec's memory is freed as the iterator advances — annotation
-    // footprint is O(k) where k is the active overlap window.
+    // Lazy Region iterator — the Vec<Region> never exists.
+    // guide_hits, hit_counts, guide_spacer_map, chrom_names are moved into
+    // the closure and consumed one guide at a time.
+    // Peak Region memory: O(1) — one Region at a time through the sweep.
+    let region_iter = {
+        let (gh, hc, gm, cn) = (guide_hits, hit_counts, guide_spacer_map, chrom_names);
+        order.into_iter().map(move |i| {
+            build_guide_region(i, &gh, &hc, &gm, &cn, sl, pl, gl)
+        })
+    };
+
     let annotator = SweepAnnotator::new(
-        scored_guides.into_iter(),
+        region_iter,
         &feature_tiles,
         |chrom| chrom_len_map.get(chrom).map(|&len| len as i64),
     );
 
     // Terminal drain: sweep → TSS distance → sink.  No collect().
-    // Progress is reported on a ~10Hz clock (every 100 ms) rather than on
-    // a fixed item count.  The modulo guard avoids a syscall per guide —
-    // we only sample the clock every 1 000 items.
     let mut guides_written: usize = 0;
     let mut last_progress_report = std::time::Instant::now();
     progress.set_items(0, total_guides_scored);
@@ -335,8 +319,6 @@ pub fn design_library(
         sink.consume(region).map_err(|e| format!("sink error: {}", e))?;
         guides_written += 1;
 
-        // Gate the clock read to every 1 000 items to avoid syscall overhead,
-        // then emit a progress update at most every 100 ms (~10 Hz).
         if guides_written % 1_000 == 0
             && last_progress_report.elapsed().as_millis() >= 100
         {
@@ -360,6 +342,46 @@ pub fn design_library(
         total_guides_scored,
         guides_written,
     })
+}
+
+/// Build one annotated Region from the SoA guide data at index `i`.
+///
+/// Called once per guide by the lazy iterator inside `design_library`.
+/// Allocates exactly one `Region` at a time — the Vec<Region> never exists.
+fn build_guide_region(
+    i:                usize,
+    guide_hits:       &GuideHits,
+    hit_counts:       &[u64],
+    guide_spacer_map: &[usize],
+    chrom_names:      &[String],
+    sl:               usize,  // spacer_len
+    pl:               usize,  // pam_len
+    gl:               usize,  // guide_len = sl + pl
+) -> Region {
+    let cid     = guide_hits.chrom_ids[i] as usize;
+    let gs      = guide_hits.guide_starts[i] as i64;
+    let ge      = guide_hits.guide_ends[i] as i64;
+    let strand  = if guide_hits.strands[i] > 0 { Strand::Forward } else { Strand::Reverse };
+
+    let spacer    = std::str::from_utf8(&guide_hits.spacers  [i * sl..(i + 1) * sl]).unwrap_or("").to_string();
+    let pam_seq   = std::str::from_utf8(&guide_hits.pam_seqs [i * pl..(i + 1) * pl]).unwrap_or("").to_string();
+    let guide_seq = std::str::from_utf8(&guide_hits.guide_seqs[i * gl..(i + 1) * gl]).unwrap_or("").to_string();
+    let guide_id  = std::str::from_utf8(&guide_hits.guide_ids [i * 8..(i + 1) *  8]).unwrap_or("").to_string();
+
+    let spacer_idx = guide_spacer_map[i];
+    let total_hits = hit_counts.get(spacer_idx).copied().unwrap_or(0);
+    let off_targets = if total_hits > 0 { total_hits - 1 } else { 0 };
+
+    Region::new(&chrom_names[cid], gs, ge)
+        .with_strand(strand)
+        .with_name(&guide_id)
+        .with_score(off_targets as f64)
+        .with_tag("spacer",     spacer)
+        .with_tag("pam_seq",    pam_seq)
+        .with_tag("guide_seq",  guide_seq)
+        .with_tag("guide_id",   guide_id)
+        .with_tag("off_targets", off_targets as i64)
+        .with_tag("total_hits",  total_hits  as i64)
 }
 
 /// Score unique spacers: search + PAM filter → hit counts per spacer.

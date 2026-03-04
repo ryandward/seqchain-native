@@ -355,6 +355,21 @@ impl FmIndexSearcher {
     pub fn from_text(text: Vec<u8>, chroms: Vec<ChromInfo>) -> Result<Self, SearchError> {
         use std::time::Instant;
 
+        fn rss_mb() -> f64 {
+            std::fs::read_to_string("/proc/self/status").ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<f64>().ok()))
+                .unwrap_or(0.0) / 1024.0
+        }
+        fn peak_mb() -> f64 {
+            std::fs::read_to_string("/proc/self/status").ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<f64>().ok()))
+                .unwrap_or(0.0) / 1024.0
+        }
+
         if chroms.is_empty() {
             return Err(SearchError::Other(anyhow::anyhow!(
                 "No chromosomes provided"
@@ -362,25 +377,25 @@ impl FmIndexSearcher {
         }
 
         let t0 = Instant::now();
-        eprintln!("[fm_index] from_text: {} bp, {} chroms",
-            text.len(), chroms.len());
+        eprintln!("[fm_index] from_text: {} bp, {} chroms  RSS={:.0}MB peak={:.0}MB",
+            text.len(), chroms.len(), rss_mb(), peak_mb());
 
         let t1 = Instant::now();
         let alphabet = Alphabet::new(b"$ACGTN");
         let sa = suffix_array(&text);
-        eprintln!("[fm_index] suffix_array (SA-IS): {:.3}s", t1.elapsed().as_secs_f64());
+        eprintln!("[fm_index] suffix_array (SA-IS): {:.3}s  RSS={:.0}MB peak={:.0}MB", t1.elapsed().as_secs_f64(), rss_mb(), peak_mb());
 
         let t2 = Instant::now();
         let bwt_seq = bwt(&text, &sa);
         let less_tbl = less(&bwt_seq, &alphabet);
-        eprintln!("[fm_index] BWT + less: {:.3}s", t2.elapsed().as_secs_f64());
+        eprintln!("[fm_index] BWT + less: {:.3}s  RSS={:.0}MB peak={:.0}MB", t2.elapsed().as_secs_f64(), rss_mb(), peak_mb());
 
         let t3 = Instant::now();
         let rank = BlockRank::from_bwt_and_less(&bwt_seq, &less_tbl);
-        eprintln!("[fm_index] BlockRank: {:.3}s ({} blocks)",
-            t3.elapsed().as_secs_f64(), rank.blocks.len());
+        eprintln!("[fm_index] BlockRank: {:.3}s ({} blocks)  RSS={:.0}MB peak={:.0}MB",
+            t3.elapsed().as_secs_f64(), rank.blocks.len(), rss_mb(), peak_mb());
 
-        eprintln!("[fm_index] total: {:.3}s", t0.elapsed().as_secs_f64());
+        eprintln!("[fm_index] total: {:.3}s  RSS={:.0}MB peak={:.0}MB", t0.elapsed().as_secs_f64(), rss_mb(), peak_mb());
 
         Ok(FmIndexSearcher {
             rank,

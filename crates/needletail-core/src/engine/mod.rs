@@ -7,6 +7,7 @@
 //!
 //! Import hierarchy: `geometry` (never chemistry, operations, io, or lib).
 
+pub mod affine;
 pub mod fm_index;
 pub mod kmer_index;
 pub mod simd_search;

@@ -2,13 +2,14 @@
   <img src="logo.png" alt="Needletail" width="500">
 </p>
 
-<p align="center"><strong>A SIMD-accelerated FM-Index aligner for CRISPR guide design.</strong></p>
+<p align="center"><strong>A SIMD-accelerated FM-Index engine for genomic sequence search.</strong></p>
 
-Needletail is a Rust + PyO3 short-read aligner purpose-built for the
-off-target scoring bottleneck in CRISPR guide design pipelines.  It replaces
-Bowtie 1's subprocess-and-disk workflow with an in-process, memory-mapped
-FM-Index searched by an AVX2 vertical automaton — delivering 3–28x faster
-mismatch search while producing bit-identical results.
+Needletail is a general-purpose Rust short-read alignment engine. The BWT
+FM-Index, AVX2 vertical automaton, streaming annotation pipeline, and
+columnar output layer are fully recomposable — CRISPR guide design is one
+application, parameterised by a preset YAML. The same engine routes RNA-seq
+reads, restriction site maps, or TF binding site scans through the same
+`RegionSink` without changing a line of engine code.
 
 Needletail ships as a native Python extension (`needletail`) and
 integrates directly into the
@@ -120,20 +121,31 @@ src/
 ├── engine/             BWT search structures
 │   ├── fm_index.rs     BlockRank, rank/occ queries
 │   ├── kmer_index.rs   K=10 / K=14 seed tables, PosTable
-│   └── simd_search.rs  AVX2 vertical automaton, width-first BFS
+│   ├── simd_search.rs  AVX2 vertical automaton, width-first BFS
+│   └── affine.rs       Tensor pivot + splice-aware affine extension
+│                       pivot_reads · extend_batch · SpliceParams
 │
 ├── io/                    Disk boundary
+│   ├── fastq.rs           Streaming FASTQ parser (O(C) chunked)
+│   │                      ChunkedFastq · FastqRecord
 │   ├── persist.rs         rkyv zero-copy serialization, mmap
 │   ├── parquet_hits.rs    Arrow zero-copy HitAccumulator export
 │   ├── parquet_regions.rs RegionSink → Parquet (columnar output)
-│   └── json.rs            RegionSink → JSON (streaming output)
+│   ├── json.rs            RegionSink → JSON (streaming output)
+│   └── sam.rs             RegionSink → SAM text output
+│                          SamSink · score_to_mapq
 │
 ├── operations/         Hot loops (composition layer)
 │   └── pam_scanner.rs  PAM site scanning, guide enrichment,
 │                       PAM validation, off-target filtering
 │
-└── lib.rs              Orchestration & FFI (only file that imports pyo3)
-    FmIndex · GuideBuffer · search_batch · scan_guides
+├── pipeline/           Orchestration (all layers composed here)
+│   ├── align.rs        Short-read aligner
+│   │                   align_fastq · AlignConfig · AlignStats
+│   └── design.rs       CRISPR guide design pipeline
+│
+└── lib.rs              Public API, re-exports, generic helpers
+    IndexHandle · SeedTier · run_search_seeded · prepare_queries
 ```
 
 ### The FM-Index: BlockRank
@@ -245,6 +257,81 @@ K-mer seed tables pre-index the genome at K=10 (8 MiB, for mm ≤ 2) and K=14
 looks up candidate SA intervals, and restricts the BFS to only those
 intervals.  The `select_tier()` router dynamically picks K=10 or K=14 based
 on the mismatch budget and query length.
+
+### Rust API: General-purpose alignment
+
+`align_fastq` routes any short-read FASTQ through the FM-Index without the
+Python layer.  Output flows through `RegionSink` — the same streaming
+interface used by the CRISPR design pipeline.
+
+```rust
+use std::path::Path;
+use std::sync::Arc;
+use needletail_core::{
+    align_fastq, AlignConfig, IndexHandle,
+    build_seed_tier_for_handle,
+    io::sam::SamSink,
+    engine::kmer_index::SEED_K_SMALL,
+};
+
+// Build or mmap-load an index
+let handle = IndexHandle::Built(Arc::new(index));
+let text   = handle.text().to_vec();
+
+// Build the K=10 seed tier (SA sweep: O(N), one-time cost)
+let tier = build_seed_tier_for_handle(&handle, &text, "genome.seqchain", SEED_K_SMALL)
+    .expect("seed tier");
+
+// Chromosome names and lengths for the SAM header
+let chroms: Vec<(String, usize)> = handle.chrom_names()
+    .into_iter()
+    .zip(handle.chrom_geometry().lengths())
+    .collect();
+
+// Streaming SAM output — O(chunk_size) peak RAM regardless of read count
+let mut sink = SamSink::create(Path::new("output.sam"), &chroms)?;
+let stats = align_fastq(
+    &*handle,
+    &tier.seed_table,
+    &tier.pos_table,
+    &text,
+    &handle.chrom_geometry(),
+    Path::new("reads.fastq"),
+    &mut sink,
+    &AlignConfig { max_mm: 2, chunk_size: 100_000, ..Default::default() },
+)?;
+eprintln!("{}/{} reads mapped", stats.mapped_reads, stats.total_reads);
+```
+
+**O(C) RAM invariant.**  The pipeline processes reads in chunks of
+`chunk_size` (default 100K).  At each cycle the live allocation is:
+
+| Structure | Size |
+|-----------|------|
+| `chunk` (raw reads) | `C × L` bytes |
+| `fwd + rc` sequences | `C × 2L` bytes |
+| `HitAccumulator` | `C × h̄ × 13` bytes |
+| Active SAM row buffer | O(one record) |
+
+For C = 100K, L = 150, h̄ = 2: **~48 MB peak**, independent of total
+read count N.  The `RegionSink::consume()` drain completes before the
+next chunk is loaded.
+
+**Tensor pivot + affine extension.**  After the BWT seed stage, mapped
+reads are batched in groups of 8.  `pivot_reads` transposes K row-major
+reads into L column-major SIMD lanes — the spatial axis of the sequences
+becomes the temporal axis of SIMD execution, paid O(K×L) once before the
+inner loop.  `extend_batch` then advances all 8 (read, anchor) pairs
+through the affine splice automaton with zero branches: substitution,
+gap open/extend, and GT-AG splice donor/acceptor detection are all
+bitwise `blendv` / `max_epi32` operations over 8-lane i32 registers.
+
+| Operation | Instruction | Branches |
+|-----------|-------------|----------|
+| Base match/mismatch | `blendv_epi8(σ_mm, σ_match, cmpeq)` | 0 |
+| GT-AG splice signal | `i32gather + cmpeq` on dinucleotide | 0 |
+| Gap open vs extend | `max_epi32(M − γ_o, E − γ_e)` | 0 |
+| Best-score tracking | `cmpgt + blendv` | 0 |
 
 ### Python API
 

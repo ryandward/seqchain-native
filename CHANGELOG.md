@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`engine/affine.rs` — Tensor pivot + splice-aware affine extension.**
+  `pivot_reads` transposes K row-major reads into column-major `[i32; 8]`
+  SIMD lanes, paying the O(K×L) gather cost once before the inner loop.
+  `extend_batch` advances up to 8 (read, anchor) pairs simultaneously
+  through the affine splice automaton; all state transitions (substitution,
+  gap open/extend, GT-AG intron detection) are zero-branch `blendv` /
+  `max_epi32` operations. Scalar fallback for non-AVX2 targets.
+  Exports: `pivot_reads`, `extend_batch`, `SpliceParams`.
+
+- **`io/fastq.rs` — Streaming FASTQ parser enforcing O(C) invariant.**
+  `ChunkedFastq<R: BufRead>` is an iterator yielding `Vec<FastqRecord>`
+  of bounded size `chunk_size`. A single line buffer is reused across all
+  records; sequences are ASCII-uppercased on read. QNAME is truncated at
+  the first whitespace (SAM §1.4). Handles gzipped or plain FASTQ via any
+  `BufRead` source. Exports: `ChunkedFastq`, `FastqRecord`.
+
+- **`io/sam.rs` — Streaming SAM output sink.**
+  `SamSink` implements `RegionSink` for SAM v1.6 text output. The SAM
+  header (`@HD`, `@SQ` per chromosome, `@PG`) is written at construction.
+  Each `consume()` call serialises one alignment line with optional
+  auxiliary tags `NM:i`, `AS:i`, `NH:i`. Unmapped reads receive FLAG 4.
+  `score_to_mapq` converts BWT SCORE_LUT scores to SAM MAPQ [0, 60].
+  Exports: `SamSink`, `score_to_mapq`.
+
+- **`pipeline/align.rs` — General-purpose short-read aligner.**
+  `align_fastq` is the O(C) orchestration loop: `ChunkedFastq` → BWT
+  seeded search → SIMD affine extension → `RegionSink`. Peak RAM is
+  bounded by `chunk_size × read_len × 3`, independent of total read count.
+  Multi-mapper detection sets MAPQ = 0 per SAM convention. Exports:
+  `align_fastq`, `AlignConfig`, `AlignStats`, `AlignError`.
+
+- **README: engine recharacterised as general-purpose.** Tagline, intro,
+  architecture tree, and new "Rust API: General-purpose alignment" section
+  document `align_fastq`, the O(C) invariant, and the tensor pivot.
+
 ### Changed
 
 - **Single-pass master buffer architecture** — `Genome` struct replaced
