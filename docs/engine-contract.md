@@ -40,6 +40,9 @@ presets/recognition/*.yaml  ──┐
 presets/tiling/*.yaml       ──┘         │
                                         ├──► GET /api/presets/{category}
                                         └──► GET /api/methods (select options)
+
+presets/naming.yaml  ──► NamingConfig::default_config() ──► load_genbank(path, &priority)
+                         (organism-independent, not in PresetRegistry)
 ```
 
 ### How a select parameter is built
@@ -66,6 +69,7 @@ Presets are organized by **axis of variation**, not by biological concept:
 |----------|----------------------|----------|
 | `recognition` | How to find target sites — motif, flanking length, directionality | SpCas9, Cas12a, Cas12m, (future: Himar1, Tn5) |
 | `tiling` | How to partition the genome into named regions based on gene proximity | saccer3 (yeast), (future: ecoli_k12, human_hg38) |
+| *(standalone)* | `presets/naming.yaml` — organism-independent attribute name priority for `Region.name` resolution. Not in the registry; loaded via `NamingConfig::default_config()`. | gene > locus_tag > Name > standard_name > product > ID |
 
 These axes are **orthogonal**. A pipeline run composes one preset from each
 axis: `recognition × tiling`. No combinatorial explosion — you don't need
@@ -92,23 +96,32 @@ description: >
 ```yaml
 type: feature
 organism: "S. cerevisiae"
+
 features:
   gene_body:
     relation: overlap
     priority: 1
     anchor: five_prime
+    distance_label: offset_from_start   # injected as tag key by the Glass
   promoter:
     relation: upstream
     max_distance: 500
     priority: 2
     anchor: five_prime
+    distance_label: distance_to_tss
   terminator:
     relation: downstream
     max_distance: 200
     priority: 3
     anchor: three_prime
-default_feature: intergenic
+    distance_label: distance_to_tes
+
+priority: [gene_body, promoter, terminator]
 ```
+
+`distance_label` is the tag key used for the signed-distance column in output files.
+The Stone writes a generic integer; the YAML names what it means biologically.
+No biological string is hardcoded in compiled Rust.
 
 ### Embedding strategy
 
@@ -129,7 +142,7 @@ remain the canonical source; the Rust code is a consumer, not an author.
 | `detail(category)` | Full parsed YAML with injected `id` field |
 
 The typed structs (`CRISPRPreset`, `FeatureConfig`) delegate to the registry
-for lookup:
+for lookup. `NamingConfig` is standalone (embedded, not registry-indexed):
 
 ```rust
 CRISPRPreset::by_name("spcas9")
@@ -138,7 +151,12 @@ CRISPRPreset::by_name("spcas9")
 
 FeatureConfig::by_name("saccer3")
 // → PresetRegistry::yaml("tiling", "saccer3")
-// → serde_yaml::from_str → FeatureConfig
+// → serde_yaml::from_str → FeatureConfig { features, name_priority: ... }
+
+NamingConfig::default_config()
+// → include_str!("presets/naming.yaml")
+// → serde_yaml::from_str → NamingConfig { name_priority: ["gene", "locus_tag", ...] }
+// passed to load_genbank(path, &naming.name_priority) at parse time
 ```
 
 ## Async job protocol
@@ -146,7 +164,7 @@ FeatureConfig::by_name("saccer3")
 Needletail methods are async. The dispatch flow is:
 
 ```
-POST /api/methods/design_library
+POST /api/methods/design_crispr_library
   body: {"genome": "engine-file-id", "preset": "spcas9", "feature_config": "saccer3"}
   returns: {"job_id": "abc123"}
 

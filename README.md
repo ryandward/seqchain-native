@@ -139,10 +139,10 @@ src/
 │   └── pam_scanner.rs  PAM site scanning, guide enrichment,
 │                       PAM validation, off-target filtering
 │
-├── pipeline/           Orchestration (all layers composed here)
-│   ├── align.rs        Short-read aligner
-│   │                   align_fastq · AlignConfig · AlignStats
-│   └── design.rs       CRISPR guide design pipeline
+├── pipeline/                    Orchestration (all layers composed here)
+│   ├── align.rs                 Short-read aligner
+│   │                            align_fastq · AlignConfig · AlignStats
+│   └── design_crispr_library.rs CRISPR guide design pipeline
 │
 └── lib.rs              Public API, re-exports, generic helpers
     IndexHandle · SeedTier · run_search_seeded · prepare_queries
