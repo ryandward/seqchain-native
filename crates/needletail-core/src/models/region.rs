@@ -117,7 +117,7 @@ pub struct Region {
     pub start: i64,
     pub end: i64,
     pub strand: Strand,
-    pub score: f64,
+    pub score: Option<f64>,
     pub name: String,
     pub tags: HashMap<String, TagValue>,
 }
@@ -130,7 +130,7 @@ impl Region {
             start,
             end,
             strand: Strand::Unstranded,
-            score: 0.0,
+            score: None,
             name: String::new(),
             tags: HashMap::new(),
         }
@@ -150,7 +150,7 @@ impl Region {
 
     /// Builder: set score.
     pub fn with_score(mut self, score: f64) -> Self {
-        self.score = score;
+        self.score = Some(score);
         self
     }
 
@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(r.center(), 150);
         assert_eq!(r.strand, Strand::Forward);
         assert_eq!(r.name, "test_gene");
-        assert_eq!(r.score, 1.5);
+        assert_eq!(r.score, Some(1.5));
         assert_eq!(r.tags["feature_type"].as_str(), Some("gene"));
     }
 

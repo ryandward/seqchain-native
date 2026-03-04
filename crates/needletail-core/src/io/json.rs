@@ -27,7 +27,7 @@ pub fn region_to_json(r: &Region) -> Value {
     obj.insert("start".into(),  json!(r.start));
     obj.insert("end".into(),    json!(r.end));
     obj.insert("strand".into(), json!(r.strand.as_str()));
-    obj.insert("score".into(),  sanitize_float(r.score));
+    obj.insert("score".into(),  sanitize_score(r.score));
 
     let mut tags: Vec<(&str, Value)> = r.tags
         .iter()
@@ -53,13 +53,17 @@ fn tag_value_to_json(v: &TagValue) -> Value {
     }
 }
 
-/// Sanitize a float: NaN and Inf become null.
-fn sanitize_float(f: f64) -> Value {
-    if f.is_finite() {
-        json!(f)
-    } else {
-        Value::Null
+/// Sanitize an optional score: None and non-finite become null.
+fn sanitize_score(s: Option<f64>) -> Value {
+    match s {
+        Some(f) if f.is_finite() => json!(f),
+        _ => Value::Null,
     }
+}
+
+/// Sanitize a float tag value: NaN and Inf become null.
+fn sanitize_float(f: f64) -> Value {
+    if f.is_finite() { json!(f) } else { Value::Null }
 }
 
 /// Write a JSON array of Regions to a writer, streaming one object at a time.

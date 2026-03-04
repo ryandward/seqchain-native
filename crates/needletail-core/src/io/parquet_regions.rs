@@ -223,10 +223,9 @@ impl ParquetFileSink {
             start.append_value(region.start);
             end.append_value(region.end);
             strand.append_value(region.strand.as_str());
-            if region.score.is_finite() {
-                score.append_value(region.score);
-            } else {
-                score.append_null();
+            match region.score {
+                Some(f) if f.is_finite() => score.append_value(f),
+                _ => score.append_null(),
             }
 
             for (i, (name, _)) in self.tag_cols.iter().enumerate() {

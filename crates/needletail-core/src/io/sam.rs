@@ -112,7 +112,7 @@ impl RegionSink for SamSink {
     fn consume(&mut self, region: Region) -> io::Result<()> {
         self.count += 1;
 
-        let unmapped = region.chrom == "*" || region.score <= 0.0;
+        let unmapped = region.chrom == "*" || region.score.map_or(true, |s| s <= 0.0);
 
         // ── FLAG ──────────────────────────────────────────────────────────
         let mut flag: u16 = 0;
@@ -138,7 +138,7 @@ impl RegionSink for SamSink {
         let mapq: u8 = if unmapped {
             0
         } else {
-            tag_u8(&region, "mapq").unwrap_or_else(|| score_to_mapq(region.score))
+            tag_u8(&region, "mapq").unwrap_or_else(|| score_to_mapq(region.score.unwrap_or(0.0)))
         };
 
         // ── CIGAR ─────────────────────────────────────────────────────────
@@ -178,7 +178,7 @@ impl RegionSink for SamSink {
         }
         if !unmapped {
             // AS:i — alignment score scaled to [0, 255]
-            let as_score = (region.score * 100.0).round().clamp(0.0, 255.0) as u8;
+            let as_score = (region.score.unwrap_or(0.0) * 100.0).round().clamp(0.0, 255.0) as u8;
             write!(self.writer, "\tAS:i:{as_score}")?;
         }
         if let Some(nh) = tag_i64(&region, "nhits") {
