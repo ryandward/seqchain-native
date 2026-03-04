@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 /// A Rayon thread pool that deliberately leaves cores free for the Tokio reactor.
 ///
-/// Without this, `par_iter` inside `design_library` saturates every logical
+/// Without this, `par_iter` inside `design_crispr_library` saturates every logical
 /// core and starves the async executor — the 10Hz HTTP poll from GenomeHub
 /// never gets scheduled.
 static COMPUTE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
@@ -37,7 +37,7 @@ fn compute_pool() -> &'static rayon::ThreadPool {
 
 use needletail_core::io::parquet_regions::ParquetFileSink;
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
-use needletail_core::pipeline::design::{self, LibraryResult, ProgressSink};
+use needletail_core::pipeline::design_crispr_library::{self, LibraryResult, ProgressSink};
 
 use crate::stores::genome_store::StoredGenome;
 
@@ -171,7 +171,7 @@ impl JobManager {
         }
     }
 
-    /// Submit a design_library job to run in the background.
+    /// Submit a design_crispr_library job to run in the background.
     pub fn submit(
         &self,
         genome: Arc<StoredGenome>,
@@ -233,7 +233,7 @@ impl JobManager {
                     // pool.  This ensures the global Rayon pool (and therefore
                     // the Tokio reactor's threads) are never crowded out.
                     let pipeline_result = compute_pool().install(|| {
-                        design::design_library(
+                        design_crispr_library::design_crispr_library(
                             &genome.genome,
                             &genome.index,
                             genome.tier_small.as_ref(),

@@ -1,4 +1,4 @@
-//! Pipeline orchestrator — wires all stages into `design_library()`.
+//! Pipeline orchestrator — wires all stages into `design_crispr_library()`.
 //!
 //! This replaces SeqChain's `library.py::run_job()`. It is the only module
 //! that imports from all other layers.
@@ -9,6 +9,27 @@
 //! 3. Guide enrichment (operations/pam_scanner)
 //! 4. Off-target scoring (engine/)
 //! 5. Sweep-line annotation → terminal sink (zero additional RAM)
+//!
+//! # Design philosophy — exhaustive search as the conservative standard
+//!
+//! Guide elimination here is performed by exhaustive BWT search: every
+//! alignment of a spacer against the genome is found up to a fixed mismatch
+//! ceiling, regardless of where in the spacer the mismatches fall.  No
+//! position is cheaper than any other.
+//!
+//! This differs from quality-weighted approaches (e.g. Hawkins et al. 2016,
+//! *eLife*) which assign fake Phred scores to synthetic guide sequences so
+//! that Bowtie's `-n` mode applies a position-dependent mismatch cost.  In
+//! that scheme a mismatch at certain seed positions carries zero cost and
+//! contributes nothing to the alignment score — a structural blind spot that
+//! allows some off-target alignments to pass every tier of the specificity
+//! ladder as if they were perfect matches.
+//!
+//! Exhaustive search has no blind spots.  Every off-target alignment is
+//! counted with equal weight, so the mismatch ceiling is a hard biological
+//! guarantee rather than a probabilistic threshold shaped by an assumed
+//! quality model.  For the purpose of eliminating guides likely to bind
+//! unintended loci, this is the maximally conservative choice.
 
 use std::collections::HashMap;
 
@@ -58,7 +79,7 @@ impl ProgressSink for NullProgress {
     fn report(&self, _stage: &str, _current: usize, _total: usize) {}
 }
 
-/// Result of the design_library pipeline.
+/// Result of the design_crispr_library pipeline.
 ///
 /// Guides are drained directly into the `RegionSink` — they are NOT held
 /// in memory.  This struct carries only metadata.
@@ -79,7 +100,7 @@ pub struct LibraryResult {
 ///
 /// Guides are streamed through the sink one at a time.  The annotation
 /// phase runs with O(k) auxiliary memory, regardless of genome size.
-pub fn design_library(
+pub fn design_crispr_library(
     genome: &Genome,
     index: &IndexHandle,
     tier_small: Option<&SeedTier>,
@@ -346,7 +367,7 @@ pub fn design_library(
 
 /// Build one annotated Region from the SoA guide data at index `i`.
 ///
-/// Called once per guide by the lazy iterator inside `design_library`.
+/// Called once per guide by the lazy iterator inside `design_crispr_library`.
 /// Allocates exactly one `Region` at a time — the Vec<Region> never exists.
 fn build_guide_region(
     i:                usize,

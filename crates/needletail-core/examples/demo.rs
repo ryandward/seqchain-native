@@ -4,7 +4,7 @@ use needletail_core::engine::fm_index::ChromInfo;
 use needletail_core::io::genbank::load_genbank;
 use needletail_core::io::json::FileSink;
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
-use needletail_core::pipeline::design::{design_library, NullProgress};
+use needletail_core::pipeline::design_crispr_library::{design_crispr_library, NullProgress};
 use needletail_core::{FmIndexSearcher, IndexHandle, build_seed_tiers};
 
 fn main() {
@@ -37,7 +37,7 @@ fn main() {
     let out_path = Path::new("/tmp/needletail-demo-output.json");
     let t0 = std::time::Instant::now();
     let mut sink = FileSink::create(out_path).expect("failed to create output file");
-    let result = design_library(
+    let result = design_crispr_library(
         &genome, &handle, Some(&ts), Some(&tl),
         &preset, &config, &NullProgress, &mut sink,
     ).unwrap();

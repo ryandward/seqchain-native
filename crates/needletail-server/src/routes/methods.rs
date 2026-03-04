@@ -30,7 +30,7 @@ use crate::AppState;
 
 fn method_catalog() -> Vec<Value> {
     vec![json!({
-        "id": "design_library",
+        "id": "design_crispr_library",
         "name": "Whole Genome Library Design",
         "description": "Design a whole-genome CRISPR guide library. Scans for PAM sites across the entire genome, scores off-target hits via FM-Index search, and annotates all guides against feature tiles via sweep-line. Downstream consumers filter for biology.",
         "async": true,
@@ -141,7 +141,7 @@ pub async fn dispatch_method(
     let body = body.map(|Json(v)| v).unwrap_or(json!({}));
 
     match method_id.as_str() {
-        "design_library" => dispatch_design_library(&state, &body).await,
+        "design_crispr_library" => dispatch_design_crispr_library(&state, &body).await,
         _ => Err((
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({ "error": format!("No dispatcher registered for '{}'", method_id) })),
@@ -172,7 +172,7 @@ pub async fn list_presets(
 // Dispatch handlers
 // ---------------------------------------------------------------------------
 
-async fn dispatch_design_library(
+async fn dispatch_design_crispr_library(
     state: &AppState,
     body: &Value,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
